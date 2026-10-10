@@ -1,0 +1,32 @@
+# push·PR마다 코드가 멀쩡한지 검사한다 (배포는 안 한다).
+#   1) pyflakes: 문법 오류, 안 쓰는 import, 정의 안 된 이름
+#   2) import 검사: requirements.txt로 설치한 환경에서 서빙 모듈이 실제로 import되는지
+# 모델 가중치는 git에 없어서 추론 테스트는 여기서 돌리지 않는다.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 패키지 설치
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0 libegl1 libgles2
+          pip install -r requirements.txt pyflakes
+
+      - name: pyflakes
+        run: python -m pyflakes common serving scripts
+
+      - name: import 검사
+        run: python -c "import serving.analyzer, serving.consumer, serving.api, scripts.fetch_mediapipe_models"
