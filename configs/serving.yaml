@@ -1,0 +1,22 @@
+# AI 서비스 (serving/consumer.py). 배포 환경마다 이 파일의 값만 바꾼다.
+
+# 상대 경로는 레포 루트 기준.
+# 배포 모델 폴더 (skin.onnx, skin.onnx.data, meta.json). 가중치(.onnx.data)는 git 제외 → models/README.md
+model_dir: models/skin_v2
+# mediapipe 모델 폴더. git 제외 → python -m scripts.fetch_mediapipe_models
+mediapipe_models: models/mediapipe
+
+# 입력 품질 기준 — skin v2 학습 데이터와 같은 기준
+min_pixels: 1000000      # 이보다 작은 사진은 거절 (학습에 쓰지 않은 해상도)
+min_skin_px: 20000       # 피부가 이보다 적은 크롭은 버린다 (머리카락·안경 가림)
+
+kafka:
+  # confluent-kafka(librdkafka) 설정을 그대로 넘긴다. MSK 인증 등은 여기에 추가
+  client:
+    bootstrap.servers: localhost:9092
+  group_id: skin-analysis
+  topic_requested: analysis.requested
+  topic_completed: analysis.completed
+
+s3:
+  region: ap-northeast-2

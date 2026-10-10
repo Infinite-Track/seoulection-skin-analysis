@@ -1,0 +1,227 @@
+{
+  "version": "2026-10-04",
+  "model": {
+    "name": "skin v2",
+    "backbone": "convnext_small.fb_in22k_ft_in1k",
+    "params": 50637427,
+    "trained_on": "800명, 각도 ['F', 'L', 'R'], 6에폭"
+  },
+  "input": {
+    "name": "crop",
+    "shape": "(배치, 3, 세로, 가로) float32",
+    "canvas": {
+      "forehead": [
+        608,
+        288
+      ],
+      "glabella": [
+        192,
+        160
+      ],
+      "l_eye": [
+        192,
+        224
+      ],
+      "r_eye": [
+        192,
+        224
+      ],
+      "l_cheek": [
+        512,
+        576
+      ],
+      "r_cheek": [
+        512,
+        576
+      ]
+    },
+    "target_face_height": 900,
+    "mirror_right": true,
+    "pixel_mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "pixel_std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "mask_fill": 0
+  },
+  "output": {
+    "name": "logits",
+    "regression": "값 = 로짓 * std + mean, log가 true면 다시 exp(값) - 1",
+    "ordinal": "로짓 k개 → 시그모이드 → 0.5를 넘는 개수 = 등급 번호(classes의 순서), 확률의 합 = 기대 등급(연속값)",
+    "aggregate": "같은 부위의 여러 사진은 회귀 값·등급 확률을 평균한 뒤 등급을 정한다",
+    "tasks": [
+      {
+        "task": "pore_count",
+        "kind": "regression",
+        "columns": [
+          0,
+          1
+        ],
+        "regions": [
+          "l_cheek",
+          "r_cheek"
+        ],
+        "mean": 6.660103401354607,
+        "std": 0.6618573600835147,
+        "log": true
+      },
+      {
+        "task": "pore_grade",
+        "kind": "ordinal",
+        "columns": [
+          1,
+          4
+        ],
+        "regions": [
+          "l_cheek",
+          "r_cheek"
+        ],
+        "classes": [
+          "≤1",
+          "2",
+          "3",
+          "≥4"
+        ],
+        "grades": {
+          "≤1": [
+            0,
+            1
+          ],
+          "2": [
+            2
+          ],
+          "3": [
+            3
+          ],
+          "≥4": [
+            4,
+            5
+          ]
+        }
+      },
+      {
+        "task": "wrinkle_grade",
+        "kind": "ordinal",
+        "columns": [
+          4,
+          10
+        ],
+        "regions": [
+          "forehead",
+          "glabella",
+          "l_eye",
+          "r_eye"
+        ],
+        "classes": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          "6"
+        ],
+        "grades": {
+          "0": [
+            0
+          ],
+          "1": [
+            1
+          ],
+          "2": [
+            2
+          ],
+          "3": [
+            3
+          ],
+          "4": [
+            4
+          ],
+          "5": [
+            5
+          ],
+          "6": [
+            6
+          ]
+        }
+      },
+      {
+        "task": "wrinkle_ra",
+        "kind": "regression",
+        "columns": [
+          10,
+          11
+        ],
+        "regions": [
+          "l_eye",
+          "r_eye"
+        ],
+        "mean": 21.87639622004725,
+        "std": 5.55510223488031,
+        "log": false
+      },
+      {
+        "task": "pigment_grade",
+        "kind": "ordinal",
+        "columns": [
+          11,
+          15
+        ],
+        "regions": [
+          "forehead",
+          "l_cheek",
+          "r_cheek"
+        ],
+        "classes": [
+          "0",
+          "1",
+          "2",
+          "3",
+          "≥4"
+        ],
+        "grades": {
+          "0": [
+            0
+          ],
+          "1": [
+            1
+          ],
+          "2": [
+            2
+          ],
+          "3": [
+            3
+          ],
+          "≥4": [
+            4,
+            5
+          ]
+        }
+      },
+      {
+        "task": "age",
+        "kind": "regression",
+        "columns": [
+          15,
+          16
+        ],
+        "regions": [
+          "forehead",
+          "glabella",
+          "l_eye",
+          "r_eye",
+          "l_cheek",
+          "r_cheek"
+        ],
+        "mean": 41.82155245148589,
+        "std": 16.042916174392623,
+        "log": false
+      }
+    ]
+  }
+}

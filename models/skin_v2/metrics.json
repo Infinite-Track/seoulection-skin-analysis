@@ -1,0 +1,57 @@
+{
+  "model_dir": "/Users/USER/Desktop/소마/face_analysis_AI/modeling/v2/outputs/deploy/skin_v2",
+  "model": {
+    "name": "skin v2",
+    "backbone": "convnext_small.fb_in22k_ft_in1k",
+    "params": 50637427,
+    "trained_on": "800명, 각도 ['F', 'L', 'R'], 6에폭"
+  },
+  "datasets": {
+    "aihub_kr": {
+      "score": 0.7920637296058827,
+      "people": 165,
+      "crops": 4431,
+      "tasks": {
+        "pore_count": {
+          "pearson": 0.8375015904371297,
+          "spearman": 0.8538391986408008,
+          "mae": 173.1439652304688,
+          "n": 330
+        },
+        "pore_grade": {
+          "qwk": 0.482113839236026,
+          "acc": 0.6909090909090909,
+          "within1": 0.9606060606060606,
+          "spearman": 0.5499095176659557,
+          "n": 330
+        },
+        "wrinkle_grade": {
+          "qwk": 0.8863518283758227,
+          "acc": 0.543939393939394,
+          "within1": 0.9287878787878788,
+          "spearman": 0.8483877959457925,
+          "n": 660
+        },
+        "wrinkle_ra": {
+          "pearson": 0.7771080702743507,
+          "spearman": 0.7765619254213401,
+          "mae": 2.7358747336037443,
+          "n": 330
+        },
+        "pigment_grade": {
+          "qwk": 0.8181137825584203,
+          "acc": 0.5898989898989899,
+          "within1": 0.9717171717171718,
+          "spearman": 0.8502686729215327,
+          "n": 495
+        },
+        "age": {
+          "pearson": 0.9517394116065574,
+          "spearman": 0.9531197512152949,
+          "mae": 3.9608347391753447,
+          "n": 990
+        }
+      }
+    }
+  }
+}

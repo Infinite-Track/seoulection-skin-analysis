@@ -1,0 +1,9 @@
+# 이미지에 넣지 않을 것
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.DS_Store
+# mediapipe 모델은 빌드 때 받는다
+models/mediapipe

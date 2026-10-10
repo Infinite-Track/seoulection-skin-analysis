@@ -1,0 +1,13 @@
+# python 3.11 — AI 서비스 (EC2). torch 불필요
+# opencv·mediapipe 버전은 skin v2 학습 전처리와 같아야 같은 크롭이 나온다
+numpy==2.5.3
+opencv-contrib-python==5.0.0.93
+mediapipe==0.10.35
+onnxruntime==1.30.0
+pyyaml==6.0.3
+boto3
+confluent-kafka
+# HTTP 입구 (serving/api.py)
+fastapi
+uvicorn[standard]
+python-multipart
