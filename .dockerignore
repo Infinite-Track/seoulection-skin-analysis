@@ -1,9 +1,12 @@
 # 이미지에 넣지 않을 것
 .git
+.github
 .venv
 __pycache__
 *.pyc
 .env
+.env.example
 .DS_Store
-# mediapipe 모델은 빌드 때 받는다
-models/mediapipe
+# 모델 파일은 이미지 밖 (skin v2: 볼륨/S3, mediapipe: 빌드 때 받음)
+models
+tests
