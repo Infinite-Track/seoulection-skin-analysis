@@ -1,9 +1,11 @@
-# python 3.11 — AI 서비스 (EC2). torch 불필요
-# opencv·mediapipe 버전은 skin v2 학습 전처리와 같아야 같은 크롭이 나온다
-# numpy는 2.5.x가 3.12 전용이라 3.11 지원 마지막 계열(2.4.x)로 고정
+# python 3.11 — AI 서비스 (EC2 Graviton, linux/arm64). torch 불필요
+# opencv는 skin v2 학습 전처리와 같은 버전. numpy는 2.5.x가 3.12 전용이라 3.11 지원 마지막 계열(2.4.x)로 고정
 numpy==2.4.6
 opencv-contrib-python==5.0.0.93
-mediapipe==0.10.35
+# mediapipe: 학습 때는 0.10.35였지만 리눅스 ARM 휠이 없다 (0.10.18은 numpy<2 라 opencv 5와 충돌).
+# 1.1.1은 ARM·x86 모두 있고 같은 모델 파일(.task/.tflite)을 쓴다. 0.10.35 대비 측정(2026-10-15, 12명):
+# 랜드마크 ≤0.06px, 총점 ±1점, 등급 변경 1/105 — serving/README.md 참고
+mediapipe==1.1.1
 onnxruntime==1.30.0
 boto3
 confluent-kafka
