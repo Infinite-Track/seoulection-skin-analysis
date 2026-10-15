@@ -1,0 +1,4 @@
+# 테스트·검사용 (CI, 로컬). 이미지에는 넣지 않는다
+pytest
+httpx
+pyflakes

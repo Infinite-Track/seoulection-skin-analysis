@@ -1,16 +1,16 @@
-"""mediapipe 모델 파일을 구글 공식 주소에서 받는다 (pip install처럼 설치 단계에서 한 번).
+"""mediapipe 모델 파일을 구글 공식 주소에서 받는다 (pip install처럼 설치 단계에서 한 번. Docker 빌드 때 실행).
 
 mediapipe 패키지(pip)는 실행 엔진만 있고 모델 파일은 따로 받아야 한다.
 해시로 버전을 고정한다: 구글이 파일을 바꾸면 해시가 달라져 멈춘다 (전처리 결과가 달라지는 것을 막기 위해).
 이미 받은 파일은 해시가 맞으면 건너뛴다. 표준 라이브러리만 쓴다.
 
-사용: python -m scripts.fetch_mediapipe_models
+사용: python -m scripts.fetch_mediapipe_models   (저장 위치: 환경변수 MEDIAPIPE_MODELS_DIR, 기본 models/mediapipe)
 """
-import argparse
 import hashlib
+import os
 import urllib.request
 
-from common.config import load_yaml, resolve
+from common.config import resolve
 
 MODELS = {
     "face_landmarker.task": (
@@ -29,10 +29,7 @@ def sha256(path):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="serving")
-    args = ap.parse_args()
-    out_dir = resolve(load_yaml(args.config)["mediapipe_models"])
+    out_dir = resolve(os.environ.get("MEDIAPIPE_MODELS_DIR") or "models/mediapipe")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for name, (url, expected) in MODELS.items():
@@ -48,7 +45,7 @@ def main():
             raise SystemExit(f"{name} 해시 불일치 (받은 {actual}) — 구글이 파일을 바꿨을 수 있다. "
                              f"전처리 결과가 달라지므로 확인 후 MODELS의 해시를 갱신할 것")
         tmp.replace(path)
-        print(f"받음 {name}")
+        print(f"받음 {name} → {path}")
 
 
 if __name__ == "__main__":
