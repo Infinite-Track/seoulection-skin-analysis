@@ -1,8 +1,10 @@
-# python 3.11 — AI 서비스 (EC2). torch 불필요
-# opencv·mediapipe 버전은 skin v2 학습 전처리와 같아야 같은 크롭이 나온다
+# python 3.11 — AI 서비스 (EC2 seoulection-prod-ai-service, x86_64). torch 불필요
+# opencv·mediapipe는 skin v2 학습 전처리와 같은 버전 — 같은 크롭이 나와야 한다
 # numpy는 2.5.x가 3.12 전용이라 3.11 지원 마지막 계열(2.4.x)로 고정
 numpy==2.4.6
 opencv-contrib-python==5.0.0.93
+# 0.10.35는 리눅스 x86 전용. ARM(Graviton, Mac 네이티브 Docker)에서 빌드해야 하면 1.1.1로 바꿔야 하고,
+# 그때 측정된 차이(총점 ±1, 등급 변경 1/105)는 serving/README.md 참고. Mac에서는 --platform linux/amd64
 mediapipe==0.10.35
 onnxruntime==1.30.0
 boto3
