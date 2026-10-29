@@ -43,5 +43,6 @@ CLI 옵션 이름은 `TrainConfig` 필드와 같다 (`lr_head` → `--lr-head`, 
 - 증강 난수는 `(seed, 에폭, 행 번호)`로 정해진다 (노트북은 워커별 스트림). 분포는 같고, 워커 수와 무관하게 재현된다.
 - **재개(`--checkpoint-dir`)**: `last.pt`에 모델·optimizer·scheduler·GradScaler·torch 난수 상태·실행 정보(데이터셋·크롭 수·stats·l0·항목 정의·설정)를 저장한다. 배치 순서(`set_epoch`)와 증강이 에폭으로 정해지고 난수 상태를 복원하므로 "연속 2에폭"과 "1에폭 + 재개 1에폭"의 가중치가 같다(CPU에서 차이 0 확인). 실행 정보가 다르면 다른 실행의 체크포인트로 보고 멈춘다. 바꿔도 되는 설정은 `epochs`(연장), `num_workers`, `checkpoint_dir`.
 - 출력 규격 검사: `--init-from`은 베이스 체크포인트와, `evaluate`는 모델 `meta.json`과 `tasks.yaml`을 비교한다(항목 순서·종류·부위·**클래스 순서**·등급 구간·log). 다르면 멈춘다.
-- `meta.json`의 `model.name`은 `model_name`(기본 `"skin"`), `version`은 날짜. 서빙 `modelVersion`은 이 둘을 붙인 값이다. 버전 번호(`skin_vN`) 부여는 Phase 3 Register.
+- `meta.json`의 `model.name`은 `model_name`(기본 `"skin"`), `version`은 날짜. 서빙 `modelVersion`은 이 둘을 붙인 값이다. 버전 번호(`skin_vN`)는 파이프라인 Register 단계가 S3 기존 버전을 보고 정하고, 그때 `model.name`을 `"skin vN"`으로 바꾼다 (`configs/pipeline.yaml register.model_name_format`).
+- `--init-from`(또는 `SM_CHANNEL_BASE_MODEL`)에 폴더를 주면 `model.pt`, 없으면 skin v2 노트북 이름 `deploy_model.pt`를 찾는다 (S3 `models/skin_v2/`).
 - 사전학습 가중치는 timm이 Hugging Face Hub에서 받는다 (SageMaker 컨테이너에 인터넷 또는 캐시 필요).

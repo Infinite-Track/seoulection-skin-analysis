@@ -30,6 +30,7 @@ from training.losses import combine, measure_initial_losses, prior_thresholds, t
 from training.model import SkinModel
 
 CHECKPOINT_NAME, LAST_NAME = "model.pt", "last.pt"
+LEGACY_CHECKPOINT_NAMES = ("deploy_model.pt",)  # skin v2 노트북이 저장한 이름 (S3 models/skin_v2/). 폴더를 주면 model.pt 다음으로 찾는다
 RESUME_MUTABLE = {"epochs", "num_workers", "checkpoint_dir"}  # 재개할 때 바꿔도 되는 설정
 
 
@@ -48,7 +49,11 @@ def resolve_init_from(cfg):
         return None
     p = Path(source)
     if p.is_dir():
-        p = p / CHECKPOINT_NAME
+        names = (CHECKPOINT_NAME, *LEGACY_CHECKPOINT_NAMES)
+        found = [p / n for n in names if (p / n).exists()]
+        if not found:
+            raise FileNotFoundError(f"베이스 체크포인트 없음: {p}에 {list(names)} 중 하나가 있어야 한다")
+        p = found[0]
     if not p.exists():
         raise FileNotFoundError(f"베이스 체크포인트 없음: {p}")
     return p

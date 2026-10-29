@@ -34,6 +34,13 @@ HASHED_FILES = ("skin.onnx", "skin.onnx.data", "meta.json", CHECK_SCRIPT, "refer
 ONNX_TOLERANCE = 1e-3  # check_onnx.py와 같은 기준
 
 
+def write_checksums(out_dir):
+    """SHA256SUMS.txt (v2와 같은 파일 순서). meta.json을 고친 뒤에는 다시 불러야 한다 (pipelines/steps/register.py)."""
+    out_dir = Path(out_dir)
+    lines = [f"{hashlib.sha256((out_dir / f).read_bytes()).hexdigest()}  {f}" for f in HASHED_FILES]
+    (out_dir / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def load_model(checkpoint):
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     cfg = config_from_dict(saved["cfg"])
@@ -112,8 +119,7 @@ def export(checkpoint, out_dir, name=None, version=None, opset=None, reference_s
 
     # 5) check_onnx.py + SHA256SUMS.txt
     shutil.copyfile(TEMPLATE_DIR / CHECK_SCRIPT, out_dir / CHECK_SCRIPT)
-    lines = [f"{hashlib.sha256((out_dir / f).read_bytes()).hexdigest()}  {f}" for f in HASHED_FILES]
-    (out_dir / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    write_checksums(out_dir)
 
     size = (out_dir / "skin.onnx.data").stat().st_size / 1e6
     print(f"내보내기 {out_dir} | {name} {version} | 가중치 {size:.0f} MB | ONNX vs PyTorch 최대 차이 {worst:.1e}", flush=True)
