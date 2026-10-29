@@ -1,0 +1,41 @@
+# 모델이 예측하는 항목 정의 = 모델 출력 규격. skin v2(face_analysis_AI/modeling/v2 노트북의 TASKS)와 같다.
+# 순서가 곧 출력 열 순서다 (회귀 1열, 순서형 클래스 수-1열 → 총 16열).
+# 베이스 모델과 같아야 파인튜닝(--init-from)할 수 있다. 바꾸면 새 모델 버전이다 — 처음부터 학습해야 한다.
+#
+#   regression: log=true면 log(1+x)로 바꿔 학습 (개수처럼 오른쪽으로 치우친 값)
+#   ordinal:    CORAL. classes = {표시 이름: 포함하는 원래 등급}. 전체의 5% 미만인 끝 등급은 이웃과 합쳤다
+#   select:     평가 지표 (항목별 지표 평균 = 모델 비교 점수)
+
+regions: [forehead, glabella, l_eye, r_eye, l_cheek, r_cheek]
+
+tasks:
+  pore_count:
+    kind: regression
+    regions: [l_cheek, r_cheek]
+    log: true
+    select: pearson
+  pore_grade:
+    kind: ordinal
+    regions: [l_cheek, r_cheek]
+    select: qwk
+    classes: {"≤1": [0, 1], "2": [2], "3": [3], "≥4": [4, 5]}
+  wrinkle_grade:
+    kind: ordinal
+    regions: [forehead, glabella, l_eye, r_eye]
+    select: qwk
+    classes: {"0": [0], "1": [1], "2": [2], "3": [3], "4": [4], "5": [5], "6": [6]}
+  wrinkle_ra:
+    kind: regression
+    regions: [l_eye, r_eye]
+    log: false
+    select: spearman
+  pigment_grade:
+    kind: ordinal
+    regions: [forehead, l_cheek, r_cheek]
+    select: qwk
+    classes: {"0": [0], "1": [1], "2": [2], "3": [3], "≥4": [4, 5]}
+  age:
+    kind: regression
+    regions: [forehead, glabella, l_eye, r_eye, l_cheek, r_cheek]
+    log: false
+    select: pearson

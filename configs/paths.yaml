@@ -1,0 +1,17 @@
+# 경로 정의. 상대 경로는 레포 루트 기준. 코드에 경로를 하드코딩하지 않는다.
+
+# 로컬 산출물 (git 제외). 학습 결과는 <output_root>/models/<시각>/, 데이터셋은 <output_root>/datasets/<이름>/
+output_root: outputs
+
+# mediapipe 모델 (face_landmarker.task, selfie_multiclass_256x256.tflite) — python -m scripts.fetch_mediapipe_models
+mediapipe_models: models/mediapipe
+
+# AWS
+aws_region: us-east-1
+s3:
+  bucket: seoulection-prod-skin-images
+  models: models                  # models/skin_vN/ — 서빙 형식 그대로 (meta.json, skin.onnx, skin.onnx.data, ...)
+  testset: datasets/testset       # 고정 테스트셋
+  replay: datasets/replay         # 망각 방지 데이터
+  feedback: feedback              # 신규 데이터
+  artifacts: pipeline-artifacts   # 파이프라인 산출물
