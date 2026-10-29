@@ -3,16 +3,17 @@
 둘 다 training/evaluate.py(= 서빙 코드 common/predictor.py로 추론)로 재서 metrics.json 형식 결과를 낸다. 현재 모델의 저장된
 metrics.json을 믿지 않고 다시 재는 이유: 테스트셋·평가 코드가 같을 때만 비교가 공정하기 때문이다.
 
-축(axis) = (항목, 지표). --axes select면 항목별 선택 지표(configs/tasks.yaml select: QWK·피어슨·스피어맨)만, all이면 항목별 모든 지표
-(정확도·±1등급·MAE 포함). MAE는 낮을수록 좋다. 축 하나라도 새 모델이 (현재 모델 - tolerance)보다 나쁘거나 값이 없으면 실패.
+축(axis) = (항목, 지표). 기본(--axes all)은 현재 모델이 낸 항목별 **모든 지표**(선택 지표 + 정확도·±1등급·스피어맨·MAE)가 축이다 —
+선택 지표(QWK 등)가 유지돼도 정확도나 MAE가 나빠지면 불통과. MAE는 낮을수록 좋다. 축 하나라도 새 모델이 (현재 모델 - tolerance)보다
+나쁘거나 값이 없으면 실패. --axes select(항목별 선택 지표 6축만)는 로컬 분석용이며 파이프라인 등록 경로는 항상 all을 쓴다.
 
 출력 (--out 폴더):
   evaluation.json     두 모델 요약 + axes[] + failed_axes/total_axes/passed  ← Condition 단계가 failed_axes == 0 을 본다
   metrics.json        새 모델의 metrics.json (models/skin_v2/metrics.json과 같은 형식) — Register가 모델 폴더에 같이 올린다
   metrics_baseline.json  현재 모델의 metrics.json
 
-사용: python -m pipelines.steps.evaluate --candidate <model.tar.gz|폴더> --baseline <폴더> --testset <폴더> --out <폴더>
-                                        [--axes select|all] [--tolerance 0] [--testset-name aihub_kr] [--limit-people N]
+사용: python -m pipelines.steps.evaluate --candidate <model.tar.gz|폴더> --baseline <model.tar.gz|폴더> --testset <폴더> --out <폴더>
+                                        [--axes all|select] [--tolerance 0] [--testset-name aihub_kr] [--limit-people N]
 """
 from pipelines.steps.bootstrap import system_libs  # noqa: I001 (common을 import하기 전에)
 
@@ -32,6 +33,7 @@ TRAIN_CONFIG = "configs/train_pipeline.yaml"
 SPLITS_DIR = "configs/splits"
 LOWER_IS_BETTER = {"mae"}
 NOT_METRICS = {"n"}
+DEFAULT_AXES = "all"  # 등록 조건 = 모든 축. "select"는 분석용
 
 
 def testset_dataset(root, name, workdir, limit_people=None):
@@ -52,7 +54,12 @@ def testset_dataset(root, name, workdir, limit_people=None):
 
 
 def compare(candidate, baseline, tasks, axes, tolerance):
-    """두 metrics 결과(datasets[name] 블록) → 축 목록. 기준은 현재 모델이 지표를 낸 항목 전부."""
+    """두 metrics 결과(datasets[name] 블록) → 축 목록. 기준은 현재 모델이 지표를 낸 항목 전부.
+
+    axes="all": 항목마다 현재 모델이 낸 지표 전부(n 제외). "select": 항목별 선택 지표 하나(분석용).
+    """
+    if axes not in ("all", "select"):
+        raise ValueError(f"axes는 all 또는 select: {axes!r}")
     rows = []
     for task, base in baseline["tasks"].items():
         metrics = [tasks[task]["select"]] if axes == "select" else [m for m in base if m not in NOT_METRICS]
@@ -70,11 +77,12 @@ def main(argv=None):
     defaults = load_yaml(PIPELINE_CONFIG)
     parser = build_parser("새 모델 vs 현재 모델 고정 테스트셋 평가", config_default=TRAIN_CONFIG)
     parser.add_argument("--candidate", default=f"{SM_INPUT}/candidate", help="새 모델: model.tar.gz, 그 폴더, 또는 풀린 폴더")
-    parser.add_argument("--baseline", default=f"{SM_INPUT}/baseline", help="현재 운영 모델 폴더 (meta.json, skin.onnx, skin.onnx.data)")
+    parser.add_argument("--baseline", default=f"{SM_INPUT}/baseline", help="현재 운영 모델: 폴더 (meta.json, skin.onnx, skin.onnx.data) 또는 model.tar.gz")
     parser.add_argument("--testset", default=f"{SM_INPUT}/testset", help="고정 테스트셋 폴더")
     parser.add_argument("--out", default=f"{SM_OUTPUT}/evaluation")
     parser.add_argument("--testset-name", default=defaults["prepare"]["testset_name"])
-    parser.add_argument("--axes", choices=["select", "all"], default=defaults["condition"]["axes"])
+    parser.add_argument("--axes", choices=["all", "select"], default=DEFAULT_AXES,
+                        help="all: 항목별 모든 지표 (등록 조건, 기본) | select: 항목별 선택 지표만 (분석용)")
     parser.add_argument("--tolerance", type=float, default=defaults["condition"]["tolerance"])
     parser.add_argument("--limit-people", type=int, help="동작 확인용: 테스트 인물 앞 N명만")
     args = parser.parse_args(argv)
@@ -82,8 +90,10 @@ def main(argv=None):
     _, tasks = load_tasks(cfg.tasks_config)
 
     with tempfile.TemporaryDirectory(prefix="evaluate-") as tmp:
-        candidate_dir = unpack_model(args.candidate, tmp)
-        baseline_dir = unpack_model(args.baseline, tmp)
+        candidate_dir = unpack_model(args.candidate, Path(tmp) / "candidate")  # 둘 다 model.tar.gz여도 섞이지 않게 하위 폴더 분리
+        baseline_dir = unpack_model(args.baseline, Path(tmp) / "baseline")
+        if candidate_dir.resolve() == baseline_dir.resolve():
+            raise SystemExit(f"새 모델과 현재 모델이 같은 폴더다: {candidate_dir}")
         ds, people = testset_dataset(args.testset, args.testset_name, tmp, args.limit_people)
         cfg.datasets = [ds]
         print(f"테스트셋 {ds['dir']}: {people}명 | 새 모델 {candidate_dir} | 현재 모델 {baseline_dir}", flush=True)

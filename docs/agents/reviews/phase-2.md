@@ -1,3 +1,4 @@
+VERDICT: PASS
 # Phase 2 검토
 
 ## 요약
@@ -33,3 +34,33 @@
 3. 실제 S3 업로드는 이번 검토에서 실행하지 않았다. 위 수정과 로컬 검증 후 사람이 실행하는 기존 절차를 유지한다. — ✅ 반영 (절차 유지, 실행하지 않음)
 
 신규 데이터 라벨 형식·replay 혼합 비율·SageMaker 채널 연결은 보고서에 미결정 또는 후속 Phase 사항으로 남아 있다. 이번 리뷰가 그 결정을 대신 확정하지 않는다. 이번 검토에서는 리뷰 파일만 수정했다.
+
+## 재검토 (1회차)
+
+2026-10-29 — **통과. 기존 Major 2건 해결 확인. 이번 재검토 범위에서 추가 Critical·Major 발견 없음.**
+
+### 실행한 검증
+
+- 최신 `AGENTS.md`의 판정 형식에 따라 첫 줄을 `VERDICT: PASS`로 갱신했다. 기존 검토 본문은 보존했다.
+- `git status --short`, `git diff main --stat`, `git diff main` 확인. 이전 작업이 커밋되어 이제 main 대비 Phase 0~2의 신규 파일까지 35파일·2,799줄 추가로 나타난다. 기존 운영·서빙·테스트 및 금지 설정 파일 변경은 없고 `common/` 변경은 신규 2파일이다. 이번 수정의 `scripts/crop_index.py`, `build_crops.py`, `upload_datasets.py` 및 보고서를 직접 대조했다.
+- `.venv/bin/python -B -m pytest -q -p no:cacheprovider`: **24 passed**, 7.59초. `.venv/bin/python -B -m pyflakes common training scripts`: 오류 출력 없음.
+- `git diff main --check`는 기존 Phase 1 템플릿 `training/templates/check_onnx.py`의 CRLF를 trailing whitespace로 보고해 종료 코드 2였다. Phase 2 수정의 기능 실패로 판정하지 않았다.
+- 임시 경로 `/tmp/phase2-recheck-wk0v4v4j`에서 3명·사진 3장·6부위씩의 합성 인덱스로 다음 검증을 수행했다. 여기서 PNG는 파일 존재 검사용 표식이므로 이미지 디코딩·MediaPipe 품질 검증은 아니다.
+  - 완전한 데이터: `stage_subset` 통과, people=3.
+  - 목록의 인물 누락 / 부위 행 누락 / ok PNG 누락: 각각 `SystemExit`로 **거절**.
+  - testset은 완전하고 replay만 PNG가 없는 상태에서 `upload_datasets.main --execute` 실행 경로 검증: **업로드 함수를 대역으로 교체**했으며, replay 검증 실패 후 **upload 호출 0회**. AWS를 실제 호출하지 않았다.
+  - 사진 i0는 PNG 1개 누락, i1은 forehead 1행만 남기고 i2는 정상으로 둔 뒤 `build_crops.main` 실행. Pool·크롭 결과만 대역으로 제공해 재개 분기를 검사한 결과 **i0·i1만 재처리**, 결과 **18행**, 완전성 문제 **0**, 정상 i2는 유지됐다. 실제 MediaPipe 재처리는 이번에 반복하지 않았다.
+  - `write_csv_atomic`의 행 생성 도중 예외를 발생시킴: **기존 crops.csv 바이트가 그대로 유지됨**. 완전히 쓴 뒤에만 `os.replace`하는 구현과 일치한다.
+- 실제 aihub_kr 전체 데이터로 기본 dry-run 실행(스테이징 경로만 임시 경로로 변경): testset **165/165명·4,566파일**, replay **100/100명·2,774파일**, 양쪽 완전성 검사 통과. **boto3 미로드**, AWS 호출 없음.
+- 전처리 알고리즘·분할 목록·학습/export는 이번 수정에서 바뀌지 않아 이전의 원본 라벨·크롭·고정 분할 검증을 반복하지 않았다.
+
+### 기존 발견 사항 판정
+
+| 기존 번호 | 결과 | 근거 |
+|---|---|---|
+| 1 — 불완전 데이터 업로드 승인 | 해결 | `check_dataset`이 images.csv 기준 인물·사진·부위·status·PNG를 확인하며, 라벨 없는 인물도 거절한다. testset·replay 양쪽 스테이징 후에만 업로드 루프에 진입한다. 누락 3종 거절 및 upload 0회 재현. |
+| 2 — 크롭 재개 누락·직접 덮어쓰기 | 해결 | `complete_image_ids`로 6부위·status·ok 파일 존재를 확인하고 불완전 사진의 이전 행을 버린 뒤 재처리한다. CSV는 임시 파일에 기록 후 원자적으로 교체한다. 부분 행·누락 PNG 복구와 쓰기 중 예외 시 원본 보존 재현. |
+
+### Claude에게 전달할 수정 요청
+
+이번 Phase 2 재검토에서 추가 수정 요청 없음. 실제 S3 업로드 및 후속 Phase는 수행하지 않았다. 이번 작업에서는 리뷰 파일만 수정했다.

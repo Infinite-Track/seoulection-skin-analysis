@@ -39,6 +39,7 @@ BUNDLE_IGNORE = ("__pycache__", "*.pyc", ".DS_Store", "*.sh", "*.log")
 CONTAINER_REQUIREMENTS = "pipelines/requirements-container.txt"
 STEP_SCRIPTS = ("prepare", "train", "evaluate", "register")
 EVALUATION_REPORT = "EvaluationReport"
+REGISTER_AXES = "all"  # 등록 조건은 항상 모든 (항목, 지표) 축 — 선택 지표만 보는 "select"는 로컬 분석용 (Codex Phase 3 리뷰 #1)
 DRY_RUN_ROLE = "arn:aws:iam::000000000000:role/DRY-RUN-SAGEMAKER_ROLE_ARN"  # 정의 검토용 자리 표시 (실제 계정 아님)
 
 
@@ -204,7 +205,7 @@ def build_pipeline(settings, session, role, source_dir, spot=None):
         step_args=run("evaluate",
                       inputs=[s3_in("candidate", model_tar), s3_in("baseline", base_model_uri), s3_in("testset", testset_uri)],
                       outputs=[s3_out("evaluation", run_uri("evaluation"))],
-                      arguments=["--axes", cond["axes"], "--tolerance", str(cond["tolerance"]),
+                      arguments=["--axes", REGISTER_AXES, "--tolerance", str(cond["tolerance"]),
                                  "--testset-name", settings["prepare"]["testset_name"]]),
         property_files=[report],
     )

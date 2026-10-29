@@ -2,6 +2,7 @@
 import json
 import math
 import tarfile
+import tempfile
 from pathlib import Path
 
 MODEL_TAR = "model.tar.gz"  # SageMaker Training 산출물 이름
@@ -9,15 +10,18 @@ SM_INPUT, SM_OUTPUT = "/opt/ml/processing/input", "/opt/ml/processing/output"
 
 
 def unpack_model(path, workdir):
-    """학습 산출물(model.tar.gz, 그 tar가 든 폴더, 또는 이미 풀린 폴더) → meta.json이 있는 폴더(Path)."""
+    """학습 산출물(model.tar.gz, 그 tar가 든 폴더, 또는 이미 풀린 폴더) → meta.json이 있는 폴더(Path).
+
+    tar는 호출마다 workdir 아래 **새 폴더**에 푼다 — 후보·기준 모델이 둘 다 model.tar.gz여도 서로 덮어쓰지 않는다.
+    """
     path = Path(path)
     if path.is_dir() and (path / "meta.json").is_file():
         return path
     tar = path if path.is_file() else path / MODEL_TAR
     if not tar.is_file():
         raise FileNotFoundError(f"{path}: {MODEL_TAR}도 meta.json도 없다")
-    dest = Path(workdir) / tar.stem.replace(".tar", "")
-    dest.mkdir(parents=True, exist_ok=True)
+    Path(workdir).mkdir(parents=True, exist_ok=True)
+    dest = Path(tempfile.mkdtemp(prefix=tar.stem.replace(".tar", "") + "-", dir=workdir))
     with tarfile.open(tar) as tf:
         try:
             tf.extractall(dest, filter="data")

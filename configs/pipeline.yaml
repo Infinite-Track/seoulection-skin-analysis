@@ -36,9 +36,9 @@ prepare:                              # Prepare 단계
   replay_name: aihub_kr               # S3 datasets/replay/<name>/
   min_feedback_crops: 1               # 파라미터 MinFeedbackCrops 기본값. 라벨 있는 신규(feedback) 크롭이 이보다 적으면 Prepare에서 멈춘다 (0이면 replay만으로도 진행)
 
-condition:                            # Evaluate → Condition
-  axes: select                        # select: 항목별 선택 지표(tasks.yaml select)만 비교 | all: 항목별 모든 지표(acc·within1·spearman·mae 포함)
+condition:                            # Evaluate → Condition. 축 = 현재 모델이 낸 (항목, 지표) 전부 — 선택 지표뿐 아니라 acc·within1·spearman·mae 포함
   tolerance: 0.0                      # 새 모델 지표 ≥ 현재 모델 지표 - tolerance (MAE는 ≤ + tolerance). 0이면 "모든 축에서 현재 모델 이상"
+                                      # (등록 경로는 항상 모든 축을 본다. 선택 지표만 보는 evaluate --axes select는 로컬 분석용)
 
 register:                             # Condition 통과 시
   version_prefix: skin_v              # S3 <s3.models>/<version_prefix><N>/ — N은 기존 버전 최댓값 + 1 (덮어쓰기 없음)

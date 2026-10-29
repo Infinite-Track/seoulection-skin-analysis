@@ -9,6 +9,8 @@
                                                       그 외 파일은 세기만 한다 (라벨 출처가 정해지면 scripts/prepare_*.py 어댑터로 변환해 올린다)
 출력:
   --out       합친 학습 데이터셋: crops.csv, labels.csv, <source>/crops/... (person_id·image_id는 "<source>:<원래 값>" — 소스 간 충돌 방지)
+              source = "replay" 또는 "feedback/<feedback 루트 기준 상대 경로>" (예: feedback/2026-10/batch1 — 마지막 폴더 이름만 쓰면
+              2026-10/batch1과 2026-11/batch1이 충돌한다). 소스 ID·출력 파일·image_id·라벨 키가 겹치면 덮어쓰지 않고 멈춘다
   --manifest  manifest.json (소스별 인물·크롭 수, 제외 인물, 테스트셋 검증 결과)
 
 라벨 있는 feedback 크롭이 --min-feedback-crops보다 적으면 멈춘다 (0이면 replay만으로도 진행 — 파이프라인 점검용).
@@ -104,7 +106,16 @@ def find_datasets(root, max_depth=FEEDBACK_DEPTH):
     return sorted(found), other
 
 
+def feedback_source(feedback_root, dataset_dir):
+    """feedback 데이터셋 폴더 → 소스 ID "feedback/<feedback 루트 기준 상대 경로>" (루트 자체가 데이터셋이면 "feedback")."""
+    rel = Path(dataset_dir).resolve().relative_to(Path(feedback_root).resolve()).as_posix()
+    return "feedback" if rel == "." else f"feedback/{rel}"
+
+
 def link_or_copy(src, dst):
+    """src → dst (같은 볼륨이면 하드링크). dst가 이미 있으면 덮어쓰지 않고 멈춘다 — 소스 간 파일 충돌은 데이터 손상이다."""
+    if dst.exists():
+        raise SystemExit(f"출력 파일 충돌: {dst} 이미 있음 (소스 ID가 겹친다)")
     dst.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.link(src, dst)  # 같은 볼륨이면 복사 없이
@@ -129,6 +140,23 @@ def merge_source(source, root, crops, labels, out, exclude):
     summary = dict(dir=str(root), people=len({r["person_id"] for r in rows}), crop_rows=len(rows), ok_crops=copied,
                    label_rows=len(label_rows), excluded_test_people=excluded)
     return rows, label_rows, summary
+
+
+def merge_conflicts(sources, rows, labels):
+    """합친 결과의 충돌 목록: 소스 ID 중복, 출력 파일·(image_id, region) 중복, 라벨 키(person_id, region, task) 중복. 비어 있어야 정상."""
+    problems = []
+    dupes = sorted({s for s in sources if sources.count(s) > 1})
+    if dupes:
+        problems.append(f"소스 ID 중복: {dupes}")
+    for name, keys in (("출력 파일", [r["file"] for r in rows if r["status"] == "ok"]),  # 실패 행은 file이 비어 있다
+                       ("크롭 (image_id, region)", [(r["image_id"], r["region"]) for r in rows]),
+                       ("라벨 키 (person_id, region, task)", [(r["person_id"], r["region"], r["task"]) for r in labels])):
+        seen, dup = set(), set()
+        for k in keys:
+            (dup if k in seen else seen).add(k)
+        if dup:
+            problems.append(f"{name} 중복 {len(dup)}건: {sorted(map(str, dup))[:3]}")
+    return problems
 
 
 def ok_crops(crops, exclude):
@@ -183,23 +211,28 @@ def main(argv=None):
             problems = completeness_problems(d, crops, labels)
             if problems:
                 raise SystemExit(f"feedback 데이터셋 {d} 검증 실패:\n  - " + "\n  - ".join(problems))
-            feedback.append((f"feedback_{d.name}", d, crops, labels))
+            feedback.append((feedback_source(feedback_root, d), d, crops, labels))
         feedback_ok = sum(ok_crops(crops, test_people) for _, _, crops, _ in feedback)
         print(f"feedback: 데이터셋 {len(feedback)}개, 라벨 있는 ok 크롭 {feedback_ok:,}개 (형식 밖 파일 {unrecognized:,}개)", flush=True)
         if feedback_ok < args.min_feedback_crops:
             raise SystemExit(f"신규 ok 크롭 {feedback_ok}개 < 최소 {args.min_feedback_crops}개 → 학습하지 않는다")
 
-        # 4) 합치기 (replay 먼저)
+        # 4) 합치기 (replay 먼저). 소스 ID가 겹치면 파일·라벨이 섞이므로 복사 전에 멈춘다
+        inputs = [("replay", Path(args.replay), replay_crops, replay_labels), *feedback]
+        if conflicts := merge_conflicts([s for s, *_ in inputs], [], []):
+            raise SystemExit("합치기 실패:\n  - " + "\n  - ".join(conflicts))
         all_rows, all_labels, sources = [], [], {}
-        for source, root, crops, labels in [("replay", Path(args.replay), replay_crops, replay_labels), *feedback]:
+        for source, root, crops, labels in inputs:
             rows, label_rows, summary = merge_source(source, root, crops, labels, out, test_people)
             if summary["excluded_test_people"]:
                 print(f"경고: {source}에서 테스트 인물 {len(summary['excluded_test_people'])}명 제외", flush=True)
             all_rows += rows
             all_labels += label_rows
             sources[source] = summary
-            print(f"  {source:24s} {summary['people']:4d}명  ok 크롭 {summary['ok_crops']:6,}개  라벨 {summary['label_rows']:6,}행", flush=True)
+            print(f"  {source:32s} {summary['people']:4d}명  ok 크롭 {summary['ok_crops']:6,}개  라벨 {summary['label_rows']:6,}행", flush=True)
 
+    if conflicts := merge_conflicts(list(sources), all_rows, all_labels):
+        raise SystemExit("합친 데이터셋에 충돌이 있다 (소스 안의 중복 포함):\n  - " + "\n  - ".join(conflicts))
     if not any(r["status"] == "ok" for r in all_rows):
         raise SystemExit("학습할 ok 크롭이 없다")
     write_csv_atomic(out / CROPS_FILE, all_rows, COLUMNS)
