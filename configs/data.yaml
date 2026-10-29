@@ -1,0 +1,17 @@
+# 데이터 준비 설정 (scripts/prepare_aihub.py, build_crops.py, make_splits.py, upload_datasets.py)
+
+# 크롭 대상 기기. 디지털카메라는 제외 — 검은 배경 + 스튜디오 조명이라 같은 사람도 색이 크게 달라진다 (서비스 입력은 폰 사진)
+devices: [smartpad, smartphone]
+
+# 이보다 작은 사진은 저해상도로 보고 크롭하지 않는다 (얼굴 세로 900px로 맞추려면 3~4배 확대해야 함). 서빙 MIN_PIXELS와 같은 값
+min_pixels: 1000000
+
+# 인물 단위 분할
+split:
+  seed: 42
+  test_fraction: 0.17        # 새 데이터셋을 처음 나눌 때의 테스트 비율 (aihub_kr은 기존 165명 목록을 그대로 쓴다 → make_splits.py --import)
+
+# 망각 방지(replay) 데이터: 학습 인물 중 일부를 S3 datasets/replay/에 올려 파인튜닝 때 섞는다
+replay:
+  seed: 42
+  people: 100                # 올릴 인물 수 (학습 800명 중). 값은 임시 — Phase 3 설계에서 확정
