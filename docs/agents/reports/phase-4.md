@@ -148,6 +148,40 @@
 - `ClientRequestToken`은 데이터에서 유도하지 않고 예약마다 새로 만든다(uuid4). 데이터 기반 토큰이면 실패 후 재시도가 SageMaker 멱등성 때문에 **실패한 옛 실행을 돌려받을** 위험이 있다. 예약 기록이 원자적이므로 토큰의 영속성은 기록이 담당한다.
 - 실제 AWS에서만 확인할 것(기존 3개에 추가): S3 버킷이 `If-None-Match` 조건부 쓰기를 지원하는지(2024-08 이후 모든 리전 일반 버킷 지원), `list_pipeline_executions` 요약의 `PipelineExecutionDisplayName`이 start 때 준 값으로 들어오는지.
 
+## Codex 재검토 1회차 반영 (2026-10-30)
+
+재검토 결과 Major 2건: **R1** 같은 실행을 이어받은 여러 호출이 마무리할 때 늦은 호출이 다음 실행의 예약을 무조건 삭제(소유권 없음, marker read→merge→write 비원자적), **R2** dry-run이 active 복구 쓰기·완료 대기·기준점 갱신·예약 삭제까지 수행. **AWS 호출 없음** — 전부 boto3 대역 + Prefect 임시 서버.
+
+### 변경 파일 (`git diff 65fbc39 --stat`: 6파일 +480/-127)
+
+| 파일 | 내용 |
+|---|---|
+| `pipelines/prefect_flow.py` | **R1 소유권·원자성**: `read_json_s3(with_etag=True)`·`write_json_s3(if_match=ETag)`·`update_json_s3(decide)`(읽기 → 결정 → 읽은 ETag로 `If-Match` 조건부 쓰기, 412/409면 다시 읽어 반복, 최대 8회 후 RuntimeError). 예약 기록에 `state`(`reserved`→`started`→`released`) 추가. **해제는 삭제가 아니라 `released` 묘비로 조건부 덮어쓰기**(`released_record`: run_id·ARN·종료 상태·시각) — 일반 버킷에서 조건부 삭제 지원이 불확실해 PutObject `If-Match`(botocore 모델에서 일반 버킷 지원 문구 확인)만 쓴다. `release_active_task(settings, active, status)`·`record_active_task(settings, active, **fields)`·`start_pipeline_task`의 ARN 기록은 "현재 기록이 살아 있고 `run_id`가 내 것"(`owns`)일 때만 쓰고 아니면 손대지 않는다(해제 False → "다른 호출이 이미 해제했거나 새 예약" 로그). `reserve_run_task`: 기록 없음 → `If-None-Match:*`, 묘비 → 그 ETag로 `If-Match`, 살아 있음 → False. `read_active_task`는 묘비를 None으로 돌려준다. 기준점 `write_marker_task`도 같은 CAS, `merge_marker`는 기존 watermark가 더 최근이면 **None(쓰지 않음, 기존 문서 그대로)** — 이전의 "watermark만 유지하고 나머지 필드 덮어쓰기"를 바꿨다(옛 실행의 version이 더 최근 문서를 덮던 어색함 제거). **R2 dry-run 읽기 전용**: `resolve_active_task`(찾고 기록에 씀)를 `locate_active_task`(읽기만: ARN·상태·표시 이름 검색 여부)로 바꾸고, 쓰기(`record_active_task` ARN 복구 기록·해제·대기·`_finish`)는 `execute=True` 분기에서만. `execute=False`면 기록·실행 상태·기준점·신규 데이터를 읽고 `_dry_run_plan`(execute였다면: 이어받아 대기 / 끝난 실행 마무리 / 예약 확인 / 기준 미달 시작 안 함 / 예약→시작)을 로그·결과 `plan`에 남긴다. dry-run 결과 상태는 항상 `dry_run`(이전엔 기준 미달이면 `skipped`). `check` 출력에 `active`(살아 있는 기록만)·`last_released`(묘비). CLI 도움말 갱신 |
+| `configs/prefect.yaml` | `active_key` 주석: 조건부 쓰기 예약·`If-Match` 소유권·`released` 묘비 |
+| `pipelines/README.md` | "중복 실행 방지" 절 갱신(묘비·ETag), "소유권·원자성"·"dry-run은 읽기만" 절 추가, `check` 출력·권한 문구(삭제 권한 불필요, 조건부 쓰기 지원 시점, dry-run·check는 읽기만) |
+| `tests/test_prefect_flow.py` | 25 → **30개**. `FakeS3`: ETag(본문 md5, 실제 S3 단일 PUT과 같음)·`put_object(IfMatch)` 412/404·`get_object` 본문을 읽은 시점에 고정(그 뒤 쓰기와 분리). 묘비 모델에 맞춰 기존 단언 수정(`ACTIVE not in s3.objects` → `released(s3)`, `s3.deletes == []`, 예약은 묘비 위 `If-Match`). **R1**: `test_conditional_write_and_cas_update`(If-None-Match/If-Match/지워진 객체, CAS 재시도, 연속 충돌 포기), `test_release_and_record_only_touch_own_record`(남의 run_id·묘비·지워진 객체에 쓰지 않음, 두 번째 해제 무시), `test_reserve_over_released_record_is_atomic`(같은 묘비를 읽은 둘 중 하나만 성공), `test_write_marker_retries_on_conflict_and_stays_monotonic`(읽은 뒤 더 최근 값이 들어오면 내 쓰기 없음 / 더 옛 값이면 재시도 후 덮어씀), `test_flow_late_finisher_does_not_release_next_reservation`(리뷰 재현과 같은 교차 실행: A·B가 끝난 X를 이어받음 → B 마무리·해제·신규 3개·Y 예약·시작 → A 늦은 마무리 → C: Y 예약 유지, start 1회, C `in_progress`, 기준점은 X 값). **R2**: `test_dry_run_is_read_only_for_every_active_state`(진행 중(기본 wait=True, `wait_pipeline` 호출 시 fail)·끝남·ARN 없는 오래된 예약·ARN 없지만 표시 이름으로 찾은 경우·묘비+기준 미달: 전부 `puts == [] and deletes == []`, 시작 0, 기록 원본 그대로, `plan` 문구). dry-run 상태 `dry_run`+`plan` 단언으로 기존 2개 수정 |
+| `docs/agents/mlops-plan.md`, `docs/agents/reviews/phase-4.md` | 진행 현황 비고, 재검토 항목 반영 표시 |
+
+금지 경로 변경 0줄(`git diff main --name-status -- serving common models Dockerfile requirements.txt .dockerignore .env.example tests` → 신규 `A` 4개만).
+
+### 검증
+
+| 검증 | 결과 |
+|---|---|
+| `pyflakes pipelines training scripts common tests/test_prefect_flow.py tests/test_pipeline_steps.py` | 0 warnings |
+| `pytest -q` 전체 (Prefect 임시 서버, `PREFECT_HOME=/tmp/...`) | **62 passed** (기존 32 + Phase 4 30), 44초 |
+| `tests/test_prefect_flow.py` 서버 없는 모드 (`prefect_test_harness.__enter__`가 `PermissionError`를 내도록 바꿔 샌드박스 재현) | **30 passed**, 0.07초 |
+| 리뷰 R1 재현(교차 실행 A→B→A→C, `test_flow_late_finisher_does_not_release_next_reservation`) | start 요청 **1회**(Y), A의 늦은 해제는 412 → 다시 읽어 run_id 다름 → 건드리지 않음, `active_run.json`은 Y의 `started` 기록 그대로, C는 `in_progress`(Y ARN) |
+| 리뷰 R2 재현(끝난 active + `execute=False, wait=False`) | `status=dry_run`, S3 쓰기 `[]`, 삭제 `[]`, `plan`에 "끝난 실행 … 마무리: 결과 로그 → 기준점 저장 → 예약 해제 → 신규 데이터 다시 세기" |
+| CLI 종단 (대역 + Prefect 임시 서버, 실제 `configs/`): `run` → `run --execute --no-wait --param Epochs=2` → `run` → (실행 Succeeded) `run` → `run --execute` → `run` → `check` | dry-run 3회 모두 S3 쓰기 0·대기 없음(`plan`: 예약→시작 / 진행 중 이어받아 대기 / 끝난 실행 마무리); `--execute --no-wait`는 `active_run.json` 2회 쓰기(예약 `reserved` → `started`+ARN), start 1회; 마무리 `run --execute`는 `last_run.json` 쓰기 → `active_run.json` 묘비(`released`, `status Succeeded`) → 신규 0 → `skipped`; 마지막 dry-run은 `active` 없음·"신규 0개 < 최소 1개 → 시작하지 않음"; `check`는 `active null`, `last_released.state released`, 종료 코드 3 |
+| botocore 1.43 S3 모델 | `PutObject.IfMatch`: ETag 불일치 412, 경합 409(다시 ETag를 받아 재시도) — 일반 버킷 문구. `DeleteObject.IfMatch`는 설명에 버킷 종류 명시 없음 → 묘비 방식 채택 |
+
+### 설계 메모
+
+- **묘비 대신 삭제를 쓰지 않는 이유**: 조건 없는 삭제가 R1의 원인이고, 조건부 삭제(`DeleteObject If-Match`)는 일반 버킷 지원이 문서상 불확실하다. `state: released` 묘비는 PutObject `If-Match`만으로 해제·다음 예약을 모두 원자적으로 만들고, `check`에 마지막 실행 결과(`last_released`)도 남긴다. 사람이 기록을 지워도 다음 예약은 `If-None-Match:*`로 된다.
+- **남는 창**: 예약 뒤 start까지 10분(`reserve_stale_seconds`) 넘게 멈춘 프로세스의 예약은 다른 프로세스가 `abandoned`로 해제할 수 있다 — 그 뒤 원래 프로세스가 start하면 기록 소유권을 잃어 ARN을 못 쓰고(`owns` False) 실행만 남는다. 정상 경로에서 예약→start는 수 초이므로 운영 시 기준 10분을 유지하고, 발생하면 `check`로 보고 수동 정리한다.
+- 실제 AWS에서 확인할 것(추가): S3 PutObject `If-Match`가 대상 버킷에서 동작하는지(SSE-KMS 버킷도 ETag는 불투명 값으로 동작), `412`/`409` 오류 코드 문자열이 `PreconditionFailed`/`ConditionalRequestConflict`로 오는지.
+
 ## 질문
 
 없음

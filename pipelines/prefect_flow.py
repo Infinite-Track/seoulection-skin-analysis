@@ -9,19 +9,26 @@
   MIN_NEW_FEEDBACK_FILES (없으면 configs/prefect.yaml new_data.min_new_files). 추천 서버 count·export API 연동은 TODO (new_data.py).
 - "지난 실행" 기준점(watermark) = s3://<bucket>/<artifacts>/<파이프라인 이름>/prefect/last_run.json 의 watermark (그때 센 파일 중 가장 최근 시각).
   파이프라인이 Succeeded로 끝났을 때만 갱신 → 실패하면 다음 주에 같은 데이터를 다시 센다. watermark는 뒤로 가지 않는다. --since 로 수동 지정 가능.
-- 중복 실행 방지(같은 폴더 prefect/active_run.json): 파이프라인을 시작하기 전에 이 기록을 `If-None-Match: *` 로 만든다 — 이미 있으면
-  다른 실행이 진행 중이므로 시작하지 않는다. 기록에는 ClientRequestToken(run_id)·표시 이름·실행 ARN·그때의 기준점이 들어가고,
-  플로우가 시작할 때 기록이 있으면 그 실행을 **이어받는다**(ARN describe → 진행 중이면 대기, 끝났으면 결과 로그·기준점 저장·기록 삭제 후
-  신규 데이터를 다시 센다). --no-wait·대기 시간 초과·프로세스 재시작 뒤에도 같은 실행을 이어받고, start 는 한 번만 일어난다.
-  ARN을 쓰기 전에 죽었으면 표시 이름으로 실행 목록에서 찾고, 그래도 없으면(reserve_stale_seconds 지난 뒤) 예약을 지우고 새로 간다.
-  실행이 실패·중단으로 끝나면 기록을 지우고 기준점은 그대로 둔다 → 다음 실행(다음 주 스케줄 또는 수동 `run --execute`)이 같은 데이터로 재시도한다.
+- 중복 실행 방지(같은 폴더 prefect/active_run.json): 파이프라인을 시작하기 전에 이 기록을 **예약**한다 — 기록이 없으면 `If-None-Match: *`,
+  끝난 기록(state=released)이 있으면 그 ETag 로 `If-Match` 덮어쓰기. 둘 다 원자적이라 하나만 성공하고, 다른 실행이 진행 중(reserved/started)이면
+  시작하지 않는다. 기록에는 state·ClientRequestToken(run_id)·표시 이름·실행 ARN·그때의 기준점이 들어가고, 플로우가 시작할 때 진행 중 기록이 있으면
+  그 실행을 **이어받는다**(ARN describe → 진행 중이면 대기, 끝났으면 결과 로그·기준점 저장·기록 해제 후 신규 데이터를 다시 센다).
+  --no-wait·대기 시간 초과·프로세스 재시작 뒤에도 같은 실행을 이어받고, start 는 한 번만 일어난다.
+  ARN을 쓰기 전에 죽었으면 표시 이름으로 실행 목록에서 찾고, 그래도 없으면(reserve_stale_seconds 지난 뒤) 예약을 해제하고 새로 간다.
+- 소유권: 기록을 바꾸는 모든 쓰기(ARN 기록·해제·예약)는 "읽은 run_id 가 같고 ETag 가 그대로일 때만"(`If-Match`) 이루어진다 — 같은 실행을
+  여러 호출이 이어받아 마무리해도, 먼저 끝낸 호출이 해제하고 새 실행을 예약한 뒤 늦은 호출이 그 새 예약을 건드리지 못한다(412 → 다시 읽고
+  run_id 가 다르면 손을 뗀다). 기록은 지우지 않고 state=released 묘비로 남긴다(조건부 삭제 대신 조건부 덮어쓰기). 기준점(last_run.json)도
+  같은 방식으로 읽은 ETag 에 조건부 쓰기 → 기존 watermark 가 더 최근이면 쓰지 않는다(단조 증가).
+  실행이 실패·중단으로 끝나면 기록을 해제하고 기준점은 그대로 둔다 → 다음 실행(다음 주 스케줄 또는 수동 `run --execute`)이 같은 데이터로 재시도한다.
   --force 는 "최소 건수 미달이어도 시작"일 뿐, 진행 중 실행이 있으면 force 여도 새로 시작하지 않는다.
+- dry-run(execute=False, `run` 기본값)은 **읽기만** 한다: 기록·실행 상태·기준점·신규 데이터를 읽고 "execute 였다면 무엇을 했을지"를 로그로 남긴다.
+  대기·ARN 복구 기록·기준점 갱신·해제·시작 모두 하지 않는다.
 - 결과: Condition 단계 Outcome + 산출물 evaluation.json(점수·실패 축)·register.json(새 버전·S3·Model Package ARN)을 읽어 로그로 남긴다.
 
 사용
   python -m pipelines.prefect_flow check [--since ISO]                 신규 데이터 수·기준점·진행 중 실행 (S3 읽기, Prefect 서버 없이)
   python -m pipelines.prefect_flow run [--execute] [--force] [--since ISO] [--param Epochs=2 ...] [--no-wait]
-                                                                       로컬 1회 수동 실행. 기본은 dry-run(파이프라인을 시작하지 않음), --execute 로 실제 시작
+                                                                       로컬 1회 수동 실행. 기본은 dry-run(S3 읽기와 계획 로그만), --execute 로 실제 시작
   python -m pipelines.prefect_flow serve [--paused] [--cron C --timezone TZ]
                                                                        스케줄 배포 등록 + 실행 프로세스 (계속 떠 있음). Prefect 서버/Cloud는 PREFECT_API_URL
 
@@ -99,34 +106,67 @@ def iso(dt):
 # ---------------------------------------------------------------------------
 # 순수 함수 (Prefect 없이 테스트 가능)
 # ---------------------------------------------------------------------------
-def read_json_s3(s3, bucket, key):
-    """S3 JSON 객체 → dict, 없으면 None."""
+MISSING_CODES = ("NoSuchKey", "404", "NotFound")
+CONDITION_FAILED_CODES = ("PreconditionFailed", "412", "ConditionalRequestConflict", "409")
+CAS_ATTEMPTS = 8
+
+
+def read_json_s3(s3, bucket, key, with_etag=False):
+    """S3 JSON 객체 → dict, 없으면 None. with_etag=True면 (dict, ETag) — ETag는 조건부 쓰기(If-Match)에 쓴다."""
     try:
-        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+        resp = s3.get_object(Bucket=bucket, Key=key)
     except ClientError as e:
-        if e.response["Error"]["Code"] in ("NoSuchKey", "404", "NotFound"):
-            return None
+        if e.response["Error"]["Code"] in MISSING_CODES:
+            return (None, None) if with_etag else None
         raise
-    return json.loads(body)
+    obj = json.loads(resp["Body"].read())
+    return (obj, resp.get("ETag")) if with_etag else obj
 
 
-def write_json_s3(s3, bucket, key, obj, if_none_match=False):
-    """JSON 저장. if_none_match=True면 객체가 없을 때만 만들어진다(원자적) — 이미 있으면 False를 돌려준다."""
+def write_json_s3(s3, bucket, key, obj, if_none_match=False, if_match=None):
+    """JSON 저장 → s3 URI. 조건부 쓰기(원자적): if_none_match=True면 객체가 없을 때만, if_match=ETag면 그 ETag 그대로일 때만 쓴다.
+
+    조건이 맞지 않으면(이미 있음 / 누가 바꿈 / 지워짐) False 를 돌려준다. 둘 다 없으면 무조건 덮어쓴다.
+    """
     kwargs = dict(Bucket=bucket, Key=key, Body=json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"),
                   ContentType="application/json")
     if if_none_match:
         kwargs["IfNoneMatch"] = "*"
+    if if_match:
+        kwargs["IfMatch"] = if_match
     try:
         s3.put_object(**kwargs)
     except ClientError as e:
-        if if_none_match and e.response["Error"]["Code"] in ("PreconditionFailed", "412", "ConditionalRequestConflict", "409"):
+        code = e.response["Error"]["Code"]
+        if (if_none_match or if_match) and (code in CONDITION_FAILED_CODES or (if_match and code in MISSING_CODES)):
             return False
         raise
     return f"s3://{bucket}/{key}"
 
 
-def delete_json_s3(s3, bucket, key):
-    s3.delete_object(Bucket=bucket, Key=key)
+def update_json_s3(s3, bucket, key, decide, attempts=CAS_ATTEMPTS):
+    """읽기 → decide(현재 값) → 읽은 ETag 로 조건부 쓰기(compare-and-swap). 누가 사이에 바꿨으면(412/409) 다시 읽어 반복한다.
+
+    decide(current) 가 None 을 돌려주면 쓰지 않는다(조건 불일치 — 예: 내 run_id 가 아니다, 기존 기준점이 더 최근이다).
+    반환 (쓴 값 또는 None, 마지막으로 읽은 값). 객체가 없으면 If-None-Match:* 로 만든다.
+    """
+    for _ in range(attempts):
+        current, etag = read_json_s3(s3, bucket, key, with_etag=True)
+        new = decide(current)
+        if new is None:
+            return None, current
+        if write_json_s3(s3, bucket, key, new, if_none_match=etag is None, if_match=etag):
+            return new, current
+    raise RuntimeError(f"s3://{bucket}/{key} 조건부 쓰기가 {attempts}회 연속 충돌했다 — 다른 프로세스가 계속 바꾸고 있다")
+
+
+def is_active(record):
+    """예약 기록이 살아 있나(reserved/started). released 묘비나 없음은 False. state 없는 옛 기록은 살아 있는 것으로 본다."""
+    return bool(record) and record.get("state") != "released"
+
+
+def owns(record, run_id):
+    return is_active(record) and record.get("run_id") == run_id
 
 
 def start_pipeline(sm, name, parameters=None, display_name=None, client_request_token=None):
@@ -254,12 +294,23 @@ def format_summary(summary):
     return lines
 
 
+def owner_tag():
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
 def new_active_record(since, watermark, new_files, parameters):
-    """active_run.json 내용 (시작 전). run_id = SageMaker ClientRequestToken, display_name = 실행 표시 이름 (ARN 복구용)."""
+    """active_run.json 내용 (시작 전, state=reserved). run_id = SageMaker ClientRequestToken, display_name = 실행 표시 이름 (ARN 복구용)."""
     run_id, now = uuid.uuid4().hex, now_utc()
-    return dict(run_id=run_id, display_name=f"prefect-{now:%Y%m%d-%H%M%S}-{run_id[:8]}", reserved=iso(now),
-                owner=f"{socket.gethostname()}:{os.getpid()}", since=iso(since), watermark=iso(watermark), new_files=new_files,
+    return dict(state="reserved", run_id=run_id, display_name=f"prefect-{now:%Y%m%d-%H%M%S}-{run_id[:8]}", reserved=iso(now),
+                owner=owner_tag(), since=iso(since), watermark=iso(watermark), new_files=new_files,
                 parameters=parameters or None, execution_arn=None, started=None)
+
+
+def released_record(record, status):
+    """해제 묘비(state=released): 무엇이 어떻게 끝났는지만 남긴다. 다음 예약이 이 ETag 로 덮어쓴다."""
+    return dict(state="released", run_id=record.get("run_id"), display_name=record.get("display_name"),
+                execution_arn=record.get("execution_arn"), status=status, reserved=record.get("reserved"),
+                released=iso(now_utc()), released_by=owner_tag())
 
 
 def marker_document(watermark, new_files, arn, summary):
@@ -270,10 +321,10 @@ def marker_document(watermark, new_files, arn, summary):
 
 
 def merge_marker(existing, document):
-    """기준점은 뒤로 가지 않는다: 기존 watermark가 더 최근이면 그 값을 유지한다 (나머지 필드는 새 값)."""
+    """기준점은 뒤로 가지 않는다: 기존 watermark가 더 최근이면 None(쓰지 않음 — 기존 문서 그대로), 아니면 새 문서."""
     old, new = parse_time((existing or {}).get("watermark")), parse_time(document.get("watermark"))
     if old and (new is None or old > new):
-        return dict(document, watermark=existing["watermark"], watermark_kept=True)
+        return None
     return document
 
 
@@ -288,31 +339,49 @@ def read_marker_task(settings):
 
 @task(name="read-active", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
 def read_active_task(settings):
+    """살아 있는 예약 기록(reserved/started), 없거나 released 묘비면 None."""
     s3, _ = make_clients(settings["region"])
-    return read_json_s3(s3, settings["bucket"], settings["active_key"])
+    record = read_json_s3(s3, settings["bucket"], settings["active_key"])
+    return record if is_active(record) else None
 
 
-@task(name="resolve-active", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
-def resolve_active_task(settings, active):
-    """기록의 실행 ARN(없으면 표시 이름으로 찾아 기록에 채움)과 현재 상태 → (arn, status). 실행이 없으면 (None, None)."""
-    s3, sm = make_clients(settings["region"])
-    arn = active.get("execution_arn")
+@task(name="locate-active", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
+def locate_active_task(settings, active):
+    """기록의 실행을 찾는다 (읽기만) → (arn, status, recovered). ARN이 기록에 없으면 표시 이름으로 실행 목록에서 찾는다(recovered=True).
+
+    실행이 없거나 지워졌으면 (None, None, False).
+    """
+    _, sm = make_clients(settings["region"])
+    arn, recovered = active.get("execution_arn"), False
     if not arn:
         reserved = parse_time(active.get("reserved"))
         arn = find_execution(sm, settings["pipeline"], active["display_name"],
                              created_after=reserved - FIND_EXECUTION_MARGIN if reserved else None)
-        if arn:
-            write_json_s3(s3, settings["bucket"], settings["active_key"], dict(active, execution_arn=arn, recovered=iso(now_utc())))
+        recovered = bool(arn)
     if not arn:
-        return None, None
+        return None, None, False
     status = describe_status(sm, arn)
-    return (arn, status) if status else (None, None)
+    return (arn, status, recovered) if status else (None, None, False)
+
+
+@task(name="record-active", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
+def record_active_task(settings, active, **fields):
+    """내 기록(run_id 같고 살아 있음)에만 필드를 덧붙인다 — 읽은 ETag 로 If-Match. 돌려주는 값: 쓴 기록, 소유권이 없으면 현재 기록."""
+    s3, _ = make_clients(settings["region"])
+    run_id = active["run_id"]
+    written, current = update_json_s3(s3, settings["bucket"], settings["active_key"],
+                                      lambda cur: dict(cur, **fields) if owns(cur, run_id) else None)
+    return written or current
 
 
 @task(name="release-active", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
-def release_active_task(settings):
+def release_active_task(settings, active, status):
+    """내 기록만 released 묘비로 바꾼다(If-Match). 다른 호출이 먼저 해제했거나 새 예약이 들어왔으면(run_id 다름) 건드리지 않고 False."""
     s3, _ = make_clients(settings["region"])
-    delete_json_s3(s3, settings["bucket"], settings["active_key"])
+    run_id = active["run_id"]
+    written, _ = update_json_s3(s3, settings["bucket"], settings["active_key"],
+                                lambda cur: released_record(cur, status) if owns(cur, run_id) else None)
+    return written is not None
 
 
 @task(name="check-new-data", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
@@ -323,17 +392,22 @@ def check_new_data_task(settings, since):
 
 @task(name="reserve-run", cache_policy=NO_CACHE)
 def reserve_run_task(settings, record):
-    """active_run.json 을 If-None-Match:* 로 만든다 → 만들어졌으면 True, 이미 있으면 False (다른 실행이 선점)."""
+    """active_run.json 예약: 없으면 If-None-Match:*, released 묘비면 그 ETag 로 If-Match 덮어쓰기 → True. 살아 있는 기록이 있으면 False.
+
+    예약 사이의 경합(둘이 같은 묘비를 읽고 동시에 덮어쓰기)은 412 로 한쪽만 성공한다 — 진 쪽은 다시 읽고, 살아 있는 기록이면 False.
+    """
     s3, _ = make_clients(settings["region"])
-    return bool(write_json_s3(s3, settings["bucket"], settings["active_key"], record, if_none_match=True))
+    written, _ = update_json_s3(s3, settings["bucket"], settings["active_key"], lambda cur: None if is_active(cur) else record)
+    return written is not None
 
 
 @task(name="start-pipeline", cache_policy=NO_CACHE)
 def start_pipeline_task(settings, parameters, record):
-    """예약 기록의 표시 이름·토큰으로 시작하고, 기록에 ARN을 채운다 (우리가 만든 기록이므로 조건 없이 덮어쓴다)."""
+    """예약 기록의 표시 이름·토큰으로 시작하고, 내 기록에 ARN·state=started 를 채운다(If-Match)."""
     s3, sm = make_clients(settings["region"])
     arn = start_pipeline(sm, settings["pipeline"], parameters, display_name=record["display_name"], client_request_token=record["run_id"])
-    write_json_s3(s3, settings["bucket"], settings["active_key"], dict(record, execution_arn=arn, started=iso(now_utc())))
+    update_json_s3(s3, settings["bucket"], settings["active_key"],
+                   lambda cur: dict(cur, state="started", execution_arn=arn, started=iso(now_utc())) if owns(cur, record["run_id"]) else None)
     return arn
 
 
@@ -353,57 +427,92 @@ def summarize_task(settings, arn, status):
 
 @task(name="write-marker", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
 def write_marker_task(settings, document):
-    """기준점 저장 — 기존 watermark가 더 최근이면 유지(merge_marker)."""
+    """기준점 저장 — 읽은 ETag 로 조건부 쓰기(update_json_s3). 기존 watermark가 더 최근이면 쓰지 않는다(merge_marker → None).
+
+    돌려주는 값: (썼으면 s3 URI / 아니면 None, 저장돼 있는 문서).
+    """
     s3, _ = make_clients(settings["region"])
-    document = merge_marker(read_json_s3(s3, settings["bucket"], settings["marker_key"]), document)
-    return write_json_s3(s3, settings["bucket"], settings["marker_key"], document), document
+    written, current = update_json_s3(s3, settings["bucket"], settings["marker_key"], lambda cur: merge_marker(cur, document))
+    return (f"s3://{settings['bucket']}/{settings['marker_key']}" if written else None), (written or current)
 
 
-def _finish(settings, log, arn, status, watermark, new_files):
-    """종료된 실행 마무리: 요약 로그 → Succeeded면 기준점 저장 → active_run.json 삭제. 요약을 돌려준다."""
+def _finish(settings, log, active, arn, status, watermark, new_files):
+    """종료된 실행 마무리: 요약 로그 → Succeeded면 기준점 저장(단조) → 내 기록만 해제(소유권 If-Match). 요약을 돌려준다."""
     summary = summarize_task(settings, arn, status)
     for line in format_summary(summary):
         log.info(line)
     if status == "Succeeded":
         uri, document = write_marker_task(settings, marker_document(watermark, new_files, arn, summary))
-        log.info("기준점 저장 %s (watermark %s%s)", uri, document["watermark"], " — 기존 값이 더 최근이라 유지" if document.get("watermark_kept") else "")
+        if uri:
+            log.info("기준점 저장 %s (watermark %s)", uri, document["watermark"])
+        else:
+            log.info("기준점은 기존 값이 더 최근이라 그대로 둔다 (watermark %s, 실행 %s)", document.get("watermark"), document.get("execution_arn"))
     else:
         log.error("파이프라인 실행이 %s로 끝났다: %s — 기준점은 그대로 (다음 실행이 같은 데이터로 재시도한다)", status, arn)
-    release_active_task(settings)
+    if release_active_task(settings, active, status):
+        log.info("예약 해제 (run_id %s)", active.get("run_id"))
+    else:
+        log.info("예약 기록은 다른 호출이 이미 해제했거나 새 예약이 들어왔다(run_id %s) → 건드리지 않는다", active.get("run_id"))
     return summary
+
+
+def _dry_run_plan(active, status, report, min_new_files, force):
+    """execute 였다면 무엇을 했을지 (로그·결과용)."""
+    steps = []
+    if active and status and status not in TERMINAL:
+        steps.append(f"진행 중 실행 {active.get('execution_arn') or active.get('display_name')}({status}) 을 이어받아 완료까지 대기")
+    elif active and status:
+        steps.append(f"끝난 실행 {active.get('execution_arn')}({status}) 마무리: 결과 로그 → {'기준점 저장 → ' if status == 'Succeeded' else ''}예약 해제 → 신규 데이터 다시 세기")
+    elif active:
+        steps.append(f"실행 없는 예약({active.get('owner')}, {active.get('reserved')}) 확인: reserve_stale_seconds 지났으면 해제, 아니면 시작하지 않음")
+    if report.count < min_new_files and not force:
+        steps.append(f"신규 {report.count}개 < 최소 {min_new_files}개 → 시작하지 않음")
+    elif active:
+        steps.append("위 처리 뒤 신규 데이터가 기준 이상이면 예약 → 시작")
+    else:
+        steps.append(f"예약 → 파이프라인 시작 (신규 {report.count}개{' — force' if report.count < min_new_files else ''})")
+    return steps
 
 
 @flow(name=FLOW_NAME)
 def weekly_retrain(execute: bool = False, force: bool = False, since: str | None = None,
                    parameters: dict | None = None, wait: bool = True) -> dict:
-    """주간 재학습. execute=False면 신규 데이터 확인까지만(dry-run). force=True면 기준 미달이어도 시작. since는 기준점 수동 지정(ISO).
+    """주간 재학습. execute=False면 읽기만 하는 dry-run(기록·실행 상태·기준점·신규 데이터 확인 + 계획 로그, S3 쓰기·대기 없음).
 
-    parameters는 파이프라인 파라미터 덮어쓰기 ({"Epochs": "2"}), wait=False면 시작만 하고 끝낸다.
-    진행 중 실행(active_run.json)이 있으면 새로 시작하지 않고 그 실행을 이어받는다 (force 여도).
+    force=True면 기준 미달이어도 시작. since는 기준점 수동 지정(ISO). parameters는 파이프라인 파라미터 덮어쓰기 ({"Epochs": "2"}),
+    wait=False면 시작만 하고 끝낸다. 진행 중 실행(active_run.json)이 있으면 새로 시작하지 않고 그 실행을 이어받는다 (force 여도).
     """
     log = get_run_logger()
     settings = load_flow_settings()
     result = dict(pipeline=settings["pipeline"], previous=None)
 
-    # 1) 진행 중(또는 끝났지만 마무리 안 된) 실행 이어받기
+    # 1) 진행 중(또는 끝났지만 마무리 안 된) 실행 — dry-run 은 상태만 읽고, execute 는 이어받는다
     active = read_active_task(settings)
+    active_status = None
     if active:
-        arn, status = resolve_active_task(settings, active)
-        if arn is None:
+        arn, active_status, recovered = locate_active_task(settings, active)
+        if not execute:
+            result["active"] = dict(active, execution_arn=arn or active.get("execution_arn"), execution_status=active_status)
+            log.info("dry-run: 예약 기록 있음 (run_id %s, 실행 %s, 상태 %s, 예약 %s, %s) — 읽기만 한다",
+                     active.get("run_id"), arn or "없음", active_status or "없음", active.get("reserved"), active.get("owner"))
+        elif arn is None:
             age = (now_utc() - (parse_time(active.get("reserved")) or now_utc())).total_seconds()
             if age < settings["reserve_stale_seconds"]:
                 log.info("다른 프로세스가 %s 전에 예약하고 시작 중이다(%s) → 이번에는 시작하지 않는다", f"{age:.0f}초", active.get("owner"))
                 return dict(result, status="in_progress", execution_arn=None, active=active)
-            log.warning("예약만 있고 실행이 없다(%s, %.0f초 전) → 예약을 지우고 계속한다", active.get("owner"), age)
-            release_active_task(settings)
+            log.warning("예약만 있고 실행이 없다(%s, %.0f초 전) → 예약을 해제하고 계속한다", active.get("owner"), age)
+            release_active_task(settings, active, "abandoned")
         else:
+            if recovered:
+                active = record_active_task(settings, active, execution_arn=arn, state="started", recovered=iso(now_utc()))
             log.info("이전 실행 이어받음 %s (상태 %s, 예약 %s, 기준점 %s, 신규 %s개)",
-                     arn, status, active.get("reserved"), active.get("since") or "없음", active.get("new_files"))
+                     arn, active_status, active.get("reserved"), active.get("since") or "없음", active.get("new_files"))
+            status = active_status
             if status not in TERMINAL:
                 if not wait:
                     return dict(result, status="in_progress", execution_arn=arn, active=active)
                 status = wait_pipeline_task(settings, arn)   # TimeoutError 면 기록을 남겨 다음 실행이 다시 이어받는다
-            result["previous"] = _finish(settings, log, arn, status,
+            result["previous"] = _finish(settings, log, active, arn, status,
                                          parse_time(active.get("watermark")) or parse_time(active.get("since")), active.get("new_files"))
 
     # 2) 신규 데이터 확인
@@ -415,13 +524,14 @@ def weekly_retrain(execute: bool = False, force: bool = False, since: str | None
              report.by_prefix or "", settings["min_new_files"])
     result.update(since=since_dt.isoformat() if since_dt else None, new_data=report.to_dict(), min_new_files=settings["min_new_files"])
 
+    if not execute:
+        plan = _dry_run_plan(active, active_status, report, settings["min_new_files"], force)
+        log.info("dry-run: 파이프라인 %s 을 시작하지 않는다 (실제 실행은 execute=True / --execute). 파라미터 %s. execute 였다면: %s",
+                 settings["pipeline"], parameters or {}, " → ".join(plan))
+        return dict(result, status="dry_run", plan=plan)
     if report.count < settings["min_new_files"] and not force:
         log.info("신규 데이터 %d개 < 최소 %d개 → 이번 주는 재학습하지 않는다", report.count, settings["min_new_files"])
         return dict(result, status="skipped")
-    if not execute:
-        log.info("dry-run: 파이프라인 %s 을 시작하지 않는다 (실제 실행은 execute=True / --execute). 파라미터 %s",
-                 settings["pipeline"], parameters or {})
-        return dict(result, status="dry_run")
 
     # 3) 예약 → 시작 (예약이 선점돼 있으면 시작하지 않는다)
     record = new_active_record(since_dt, report.latest or since_dt, report.count, parameters)
@@ -440,7 +550,7 @@ def weekly_retrain(execute: bool = False, force: bool = False, since: str | None
     except TimeoutError:
         log.warning("대기 시간 초과 — 실행 %s 과 active_run.json 은 그대로 둔다. 다음 실행이 이어받는다", arn)
         raise
-    summary = _finish(settings, log, arn, status, report.latest or since_dt, report.count)
+    summary = _finish(settings, log, record, arn, status, report.latest or since_dt, report.count)
     result.update(summary)
     if status != "Succeeded":
         raise RuntimeError(f"파이프라인 실행이 {status}로 끝났다: {arn} (기준점은 갱신하지 않음 — 다음 실행이 같은 데이터로 재시도한다)")
@@ -454,11 +564,12 @@ def check_command(settings, since):
     """Prefect 없이 신규 데이터·기준점·진행 중 실행 기록을 본다 (S3 읽기)."""
     s3, _ = make_clients(settings["region"])
     marker = read_json_s3(s3, settings["bucket"], settings["marker_key"]) if since is None else None
-    active = read_json_s3(s3, settings["bucket"], settings["active_key"])
+    record = read_json_s3(s3, settings["bucket"], settings["active_key"])
     since_dt = parse_time(since) if since else parse_time((marker or {}).get("watermark"))
     report = make_source(settings["source"], settings["feedback"], client=s3).check(since_dt)
     enough = report.count >= settings["min_new_files"]
-    print(json.dumps(dict(report.to_dict(), marker=marker, active=active, min_new_files=settings["min_new_files"], enough=enough),
+    print(json.dumps(dict(report.to_dict(), marker=marker, active=record if is_active(record) else None,
+                          last_released=None if is_active(record) else record, min_new_files=settings["min_new_files"], enough=enough),
                      ensure_ascii=False, indent=2))
     return 0 if enough else 3
 
@@ -484,8 +595,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="command", required=True)
     c = sub.add_parser("check", help="신규 데이터 수·기준점·진행 중 실행 기록 (S3 읽기, Prefect 없이). 기준 이상이면 종료 코드 0, 미만이면 3")
     c.add_argument("--since", help="기준점 ISO 8601 (기본: S3 last_run.json watermark)")
-    r = sub.add_parser("run", help="로컬 1회 수동 실행 (기본 dry-run). 진행 중 실행이 있으면 새로 시작하지 않고 이어받는다")
-    r.add_argument("--execute", action="store_true", help="실제로 파이프라인을 시작한다 (없으면 신규 데이터 확인까지만)")
+    r = sub.add_parser("run", help="로컬 1회 수동 실행 (기본 dry-run: S3 읽기와 계획 로그만). --execute 면 진행 중 실행이 있을 때 새로 시작하지 않고 이어받는다")
+    r.add_argument("--execute", action="store_true", help="실제로 실행한다 (없으면 기록·실행 상태·신규 데이터를 읽고 계획만 로그 — 쓰기·대기 없음)")
     r.add_argument("--force", action="store_true", help="신규 데이터가 기준 미달이어도 시작 (진행 중 실행이 있으면 그래도 새로 시작하지 않음)")
     r.add_argument("--since", help="기준점 ISO 8601 (기본: S3 last_run.json watermark)")
     r.add_argument("--param", action="append", default=[], help="파이프라인 파라미터 이름=값 (예: Epochs=2, MinFeedbackCrops=0)")

@@ -3,6 +3,7 @@
 플로우 테스트는 Prefect 임시 서버(prefect_test_harness)로 돈다. 서버를 띄울 수 없는 환경(소켓 bind 금지 샌드박스)에서는
 태스크를 .fn 으로 바꿔 Prefect 엔진 없이 같은 플로우 함수를 돈다 — 플로우 로직은 같은 코드이고 Prefect 통합만 빠진다.
 """
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -25,12 +26,22 @@ SETTINGS = dict(
 MARKER, ACTIVE = SETTINGS["marker_key"], SETTINGS["active_key"]
 
 
+def s3_error(code, op):
+    return ClientError({"Error": {"Code": code, "Message": op}}, op)
+
+
 class FakeS3:
-    """키 → (바이트, LastModified). list_objects_v2 페이지네이터·get_object·put_object(IfNoneMatch)·delete_object만."""
+    """키 → (바이트, LastModified). list_objects_v2 페이지네이터·get_object(ETag)·put_object(IfNoneMatch/IfMatch)·delete_object만.
+
+    ETag = 본문 md5 (실제 S3 단일 PUT 과 같다) → 조건부 쓰기(If-Match)는 본문이 바뀌었으면 412.
+    """
 
     def __init__(self, objects=None):
         self.objects = dict(objects or {})
         self.puts, self.deletes = [], []
+
+    def etag(self, key):
+        return '"' + hashlib.md5(self.objects[key][0]).hexdigest() + '"'
 
     def get_paginator(self, name):
         assert name == "list_objects_v2"
@@ -46,16 +57,22 @@ class FakeS3:
 
     def get_object(self, Bucket, Key):
         if Key not in self.objects:
-            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": Key}}, "GetObject")
+            raise s3_error("NoSuchKey", "GetObject")
+        data = self.objects[Key][0]   # 읽은 시점의 본문 (그 뒤 다른 쓰기가 있어도 이 응답은 그대로)
 
         class Body:
             def read(_self):
-                return self.objects[Key][0]
-        return {"Body": Body()}
+                return data
+        return {"Body": Body(), "ETag": self.etag(Key)}
 
-    def put_object(self, Bucket, Key, Body, IfNoneMatch=None, **kw):
+    def put_object(self, Bucket, Key, Body, IfNoneMatch=None, IfMatch=None, **kw):
         if IfNoneMatch == "*" and Key in self.objects:
-            raise ClientError({"Error": {"Code": "PreconditionFailed", "Message": Key}}, "PutObject")
+            raise s3_error("PreconditionFailed", "PutObject")
+        if IfMatch is not None:
+            if Key not in self.objects:
+                raise s3_error("NoSuchKey", "PutObject")
+            if self.etag(Key) != IfMatch:
+                raise s3_error("PreconditionFailed", "PutObject")
         self.objects[Key] = (Body, datetime.now(timezone.utc))
         self.puts.append(Key)
 
@@ -76,7 +93,7 @@ class FakeSageMaker:
 
     def start_pipeline_execution(self, **request):
         if not self.exists:
-            raise ClientError({"Error": {"Code": "ResourceNotFound", "Message": "no pipeline"}}, "StartPipelineExecution")
+            raise s3_error("ResourceNotFound", "StartPipelineExecution")
         self.started.append(request)
         arn = ARN if len(self.started) == 1 else f"{ARN}-{len(self.started)}"
         self.executions.insert(0, {"PipelineExecutionArn": arn, "PipelineExecutionDisplayName": request.get("PipelineExecutionDisplayName"),
@@ -85,7 +102,7 @@ class FakeSageMaker:
 
     def describe_pipeline_execution(self, PipelineExecutionArn):
         if PipelineExecutionArn in self.missing:
-            raise ClientError({"Error": {"Code": "ResourceNotFound", "Message": "gone"}}, "DescribePipelineExecution")
+            raise s3_error("ResourceNotFound", "DescribePipelineExecution")
         status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
         return {"PipelineExecutionStatus": status}
 
@@ -127,15 +144,27 @@ def artifacts(evaluation=EVALUATION, register=REGISTER):
 
 
 def active_record(arn=ARN, reserved_ago=timedelta(hours=2), watermark=T0 + timedelta(hours=4), new_files=5, **extra):
-    """진행 중 실행 기록 (다른 프로세스가 남긴 것처럼)."""
+    """진행 중 실행 기록 (다른 프로세스가 남긴 것처럼). ARN 이 있으면 started, 없으면 reserved."""
     rec = prefect_flow.new_active_record(T0 - timedelta(days=7), watermark, new_files, None)
-    rec.update(reserved=(datetime.now(timezone.utc) - reserved_ago).isoformat(timespec="seconds"), owner="other-host:1",
+    rec.update(state="started" if arn else "reserved", owner="other-host:1",
+               reserved=(datetime.now(timezone.utc) - reserved_ago).isoformat(timespec="seconds"),
                execution_arn=arn, started=rec["reserved"] if arn else None, **extra)
     return rec
 
 
 def encoded(obj):
     return (json.dumps(obj).encode(), T0)
+
+
+def released(s3):
+    """active_run.json 이 해제 묘비(state=released)인가 — 끝난 실행은 지우지 않고 묘비로 남긴다."""
+    rec = s3.json(ACTIVE)
+    return bool(rec) and rec["state"] == "released"
+
+
+def call(task, *args, **kwargs):
+    """태스크를 Prefect 엔진 없이 원함수로 부른다 (순수 함수 수준 테스트용)."""
+    return getattr(task, "fn", task)(*args, **kwargs)
 
 
 # ---- 신규 데이터 소스 ----
@@ -210,18 +239,48 @@ def test_active_record_is_valid_token_and_display_name():
     assert 32 <= len(rec["run_id"]) <= 128 and rec["run_id"].isalnum()                       # SageMaker ClientRequestToken 규격
     assert rec["display_name"].startswith("prefect-") and len(rec["display_name"]) <= 82     # PipelineExecutionDisplayName 규격
     assert all(c.isalnum() or c == "-" for c in rec["display_name"]) and rec["run_id"][:8] in rec["display_name"]
-    assert rec["execution_arn"] is None and rec["since"] is None and rec["watermark"] == T0.isoformat() and rec["parameters"] == {"Epochs": "2"}
+    assert rec["state"] == "reserved" and rec["execution_arn"] is None and rec["since"] is None
+    assert rec["watermark"] == T0.isoformat() and rec["parameters"] == {"Epochs": "2"}
     assert rec["run_id"] != prefect_flow.new_active_record(None, T0, 5, None)["run_id"]
+    assert prefect_flow.is_active(rec) and prefect_flow.owns(rec, rec["run_id"]) and not prefect_flow.owns(rec, "x")
+    tomb = prefect_flow.released_record(rec, "Succeeded")
+    assert tomb["state"] == "released" and tomb["run_id"] == rec["run_id"] and tomb["status"] == "Succeeded"
+    assert not prefect_flow.is_active(tomb) and not prefect_flow.owns(tomb, rec["run_id"])
+    assert not prefect_flow.is_active(None) and prefect_flow.is_active({"run_id": "old-format-without-state"})
 
 
-def test_reserve_is_atomic_and_release_deletes():
+def test_conditional_write_and_cas_update():
+    """write_json_s3: If-None-Match(없을 때만) / If-Match(ETag 그대로일 때만). update_json_s3: 읽기→결정→조건부 쓰기, 충돌 시 재시도."""
     s3 = FakeS3()
     assert prefect_flow.write_json_s3(s3, "b", ACTIVE, {"run_id": "1"}, if_none_match=True) == f"s3://b/{ACTIVE}"
     assert prefect_flow.write_json_s3(s3, "b", ACTIVE, {"run_id": "2"}, if_none_match=True) is False   # 이미 있으면 선점 실패
-    assert s3.json(ACTIVE) == {"run_id": "1"}
-    prefect_flow.delete_json_s3(s3, "b", ACTIVE)
-    assert prefect_flow.read_json_s3(s3, "b", ACTIVE) is None
-    assert prefect_flow.write_json_s3(s3, "b", ACTIVE, {"run_id": "3"}, if_none_match=True)
+    obj, etag = prefect_flow.read_json_s3(s3, "b", ACTIVE, with_etag=True)
+    assert obj == {"run_id": "1"} and etag == s3.etag(ACTIVE)
+    assert prefect_flow.write_json_s3(s3, "b", ACTIVE, {"run_id": "3"}, if_match='"stale"') is False  # 남이 바꾼 뒤면 실패
+    assert prefect_flow.write_json_s3(s3, "b", ACTIVE, {"run_id": "3"}, if_match=etag) and s3.json(ACTIVE) == {"run_id": "3"}
+    assert prefect_flow.write_json_s3(s3, "b", "missing", {"x": 1}, if_match=etag) is False            # 지워진 객체에 If-Match → 실패
+    assert prefect_flow.read_json_s3(s3, "b", "missing", with_etag=True) == (None, None)
+
+    # CAS: 결정 함수가 None 이면 쓰지 않는다
+    written, current = prefect_flow.update_json_s3(s3, "b", ACTIVE, lambda cur: None)
+    assert written is None and current == {"run_id": "3"} and s3.puts.count(ACTIVE) == 2
+    # CAS: 읽은 직후 다른 프로세스가 바꾸면(412) 다시 읽어 그 값 위에서 결정한다
+    real_get, hits = s3.get_object, []
+
+    def get_then_other_writes(Bucket, Key):
+        resp = real_get(Bucket=Bucket, Key=Key)
+        if not hits:
+            hits.append(1)
+            s3.put_object(Bucket=Bucket, Key=Key, Body=json.dumps({"run_id": "other"}).encode())
+        return resp
+    s3.get_object = get_then_other_writes
+    written, current = prefect_flow.update_json_s3(s3, "b", ACTIVE, lambda cur: dict(cur, seen=cur["run_id"]))
+    assert written == {"run_id": "other", "seen": "other"} and current == {"run_id": "other"} and s3.json(ACTIVE) == written
+    # 계속 충돌하면 포기한다 (무한 반복 없음)
+    s3.get_object = real_get
+    s3.put_object = lambda **kw: (_ for _ in ()).throw(s3_error("ConditionalRequestConflict", "PutObject"))
+    with pytest.raises(RuntimeError, match="연속 충돌"):
+        prefect_flow.update_json_s3(s3, "b", ACTIVE, lambda cur: dict(cur or {}, n=1), attempts=3)
 
 
 def test_find_execution_by_display_name_and_describe_missing():
@@ -234,13 +293,13 @@ def test_find_execution_by_display_name_and_describe_missing():
 
 
 def test_merge_marker_never_moves_watermark_backwards():
-    newer = {"watermark": (T0 + timedelta(days=3)).isoformat()}
+    newer = {"watermark": (T0 + timedelta(days=3)).isoformat(), "version": "skin_v4"}
     doc = prefect_flow.marker_document(T0, 5, ARN, {"status": "Succeeded", "passed": True, "register": {"version": "skin_v3"}})
-    merged = prefect_flow.merge_marker(newer, doc)
-    assert merged["watermark"] == newer["watermark"] and merged["watermark_kept"] is True and merged["version"] == "skin_v3"
+    assert prefect_flow.merge_marker(newer, doc) is None                                              # 기존이 더 최근 → 쓰지 않음
     assert prefect_flow.merge_marker({"watermark": (T0 - timedelta(days=3)).isoformat()}, doc) == doc
-    assert prefect_flow.merge_marker(None, doc) == doc
-    assert prefect_flow.merge_marker(newer, dict(doc, watermark=None))["watermark"] == newer["watermark"]
+    assert prefect_flow.merge_marker({"watermark": T0.isoformat()}, doc) == doc                        # 같으면 새 문서(같은 실행의 재마무리)
+    assert prefect_flow.merge_marker(None, doc) == doc and prefect_flow.merge_marker({}, doc) == doc
+    assert prefect_flow.merge_marker(newer, dict(doc, watermark=None)) is None
 
 
 def test_summarize_reads_condition_evaluation_and_register():
@@ -317,6 +376,7 @@ def test_flow_dry_run_does_not_start_pipeline(aws):
     s3.objects.update(feedback_objects(5, T0))
     result = run_flow()  # 기본 execute=False
     assert result["status"] == "dry_run" and result["new_data"]["count"] == 5 and sm.started == [] and s3.puts == []
+    assert result["plan"] == ["예약 → 파이프라인 시작 (신규 5개)"] and "active" not in result
 
 
 def test_flow_uses_marker_as_since_and_force_overrides_minimum(aws):
@@ -324,15 +384,17 @@ def test_flow_uses_marker_as_since_and_force_overrides_minimum(aws):
     s3.objects.update(feedback_objects(5, T0))
     s3.objects[MARKER] = encoded({"watermark": (T0 + timedelta(hours=3)).isoformat()})
     result = run_flow()
-    assert result["status"] == "skipped" and result["new_data"]["count"] == 1 and result["since"] == (T0 + timedelta(hours=3)).isoformat()
+    assert result["status"] == "dry_run" and result["new_data"]["count"] == 1 and result["since"] == (T0 + timedelta(hours=3)).isoformat()
+    assert result["plan"] == ["신규 1개 < 최소 3개 → 시작하지 않음"] and s3.puts == []
+    assert run_flow(force=True)["plan"] == ["예약 → 파이프라인 시작 (신규 1개 — force)"]
     result = run_flow(force=True, wait=False, execute=True, parameters={"Epochs": "2"})
     assert result["status"] == "started" and result["execution_arn"] == ARN
     assert sm.started[-1]["PipelineParameters"] == [{"Name": "Epochs", "Value": "2"}] and MARKER not in s3.puts  # 기다리지 않으면 기준점도 없음
     active = s3.json(ACTIVE)  # 예약 기록: 토큰·표시 이름이 start 요청과 같고 ARN이 채워져 있다
-    assert active["execution_arn"] == ARN and active["run_id"] == sm.started[-1]["ClientRequestToken"]
+    assert active["state"] == "started" and active["execution_arn"] == ARN and active["run_id"] == sm.started[-1]["ClientRequestToken"]
     assert active["display_name"] == sm.started[-1]["PipelineExecutionDisplayName"] and active["parameters"] == {"Epochs": "2"}
     assert active["since"] == (T0 + timedelta(hours=3)).isoformat() and active["new_files"] == 1
-    s3.delete_object(Bucket="bucket", Key=ACTIVE)
+    s3.delete_object(Bucket="bucket", Key=ACTIVE)   # 사람이 기록을 지운 경우도 다음 예약은 If-None-Match 로 된다
     assert run_flow(since=T0.isoformat())["new_data"]["count"] == 4  # --since 가 marker 보다 우선
 
 
@@ -344,11 +406,18 @@ def test_flow_executes_waits_logs_and_writes_marker(aws):
     assert result["status"] == "Succeeded" and result["passed"] is True and result["previous"] is None
     assert result["register"]["version"] == "skin_v3" and result["evaluation"]["score"] == 0.81
     assert sm.started[0]["PipelineName"] == SETTINGS["pipeline"] and "PipelineParameters" not in sm.started[0]
-    assert s3.puts == [ACTIVE, ACTIVE, MARKER] and s3.deletes == [ACTIVE] and ACTIVE not in s3.objects  # 예약 → ARN 기록 → 기준점 → 해제
+    assert s3.puts == [ACTIVE, ACTIVE, MARKER, ACTIVE] and s3.deletes == []   # 예약 → ARN 기록 → 기준점 → 해제(묘비)
+    tomb = s3.json(ACTIVE)
+    assert tomb["state"] == "released" and tomb["execution_arn"] == ARN and tomb["status"] == "Succeeded"
+    assert tomb["run_id"] == sm.started[0]["ClientRequestToken"]
     marker = s3.json(MARKER)
     assert marker["watermark"] == (T0 + timedelta(hours=4)).isoformat() and marker["version"] == "skin_v3" and marker["new_files"] == 5
-    # 다음 주: 기준점 이후 신규가 없으면 건너뛴다
+    # 다음 주: 기준점 이후 신규가 없으면 건너뛴다 (묘비는 진행 중 실행이 아니다)
     assert run_flow(execute=True)["status"] == "skipped" and len(sm.started) == 1
+    # 다음 예약은 묘비를 If-Match 로 덮어쓴다
+    s3.objects.update(feedback_objects(3, T0 + timedelta(days=1)))
+    sm.statuses = ["Executing", "Succeeded"]
+    assert run_flow(execute=True)["status"] == "Succeeded" and len(sm.started) == 2 and released(s3)
 
 
 def test_flow_fails_without_marker_when_pipeline_fails(aws):
@@ -358,7 +427,7 @@ def test_flow_fails_without_marker_when_pipeline_fails(aws):
     with pytest.raises(RuntimeError, match="Failed"):
         run_flow(execute=True)
     assert MARKER not in s3.puts and len(sm.started) == 1
-    assert ACTIVE not in s3.objects  # 실패하면 예약을 지워 다음 실행이 같은 데이터로 재시도할 수 있다
+    assert released(s3) and s3.json(ACTIVE)["status"] == "Failed"  # 실패하면 예약을 해제해 다음 실행이 같은 데이터로 재시도할 수 있다
     sm.statuses = ["Executing", "Succeeded"]
     assert run_flow(execute=True)["status"] == "Succeeded" and len(sm.started) == 2  # 재시도 = 다음 실행에서 1회
 
@@ -380,7 +449,7 @@ def test_flow_second_call_while_running_attaches_instead_of_starting(aws):
     sm.statuses = ["Executing", "Succeeded"]
     done = run_flow(execute=True)
     assert done["status"] == "skipped" and done["previous"]["status"] == "Succeeded" and done["previous"]["register"]["version"] == "skin_v3"
-    assert len(sm.started) == 1 and ACTIVE not in s3.objects
+    assert len(sm.started) == 1 and released(s3)
     marker = s3.json(MARKER)
     assert marker["watermark"] == (T0 + timedelta(hours=4)).isoformat() and marker["new_files"] == 5 and marker["execution_arn"] == ARN
     assert done["new_data"]["count"] == 0 and done["since"] == marker["watermark"]
@@ -393,11 +462,11 @@ def test_flow_resumes_after_wait_timeout(aws):
     sm.statuses, sm.steps, settings["timeout_seconds"] = ["Executing"], STEPS_PASS, 0
     with pytest.raises(TimeoutError):
         run_flow(execute=True)
-    assert len(sm.started) == 1 and s3.json(ACTIVE)["execution_arn"] == ARN and MARKER not in s3.objects
+    assert len(sm.started) == 1 and s3.json(ACTIVE)["execution_arn"] == ARN and s3.json(ACTIVE)["state"] == "started" and MARKER not in s3.objects
     settings["timeout_seconds"], sm.statuses = 60, ["Executing", "Succeeded"]
     result = run_flow(execute=True)
     assert result["status"] == "skipped" and result["previous"]["status"] == "Succeeded" and len(sm.started) == 1
-    assert s3.json(MARKER)["watermark"] == (T0 + timedelta(hours=4)).isoformat() and ACTIVE not in s3.objects
+    assert s3.json(MARKER)["watermark"] == (T0 + timedelta(hours=4)).isoformat() and released(s3)
 
 
 def test_flow_recovers_after_restart_with_arn_in_record(aws):
@@ -407,11 +476,11 @@ def test_flow_recovers_after_restart_with_arn_in_record(aws):
     sm.statuses, sm.steps = ["Succeeded"], STEPS_PASS
     result = run_flow(execute=True)
     assert result["previous"]["status"] == "Succeeded" and sm.started == []
-    assert s3.json(MARKER)["watermark"] == (T0 + timedelta(hours=4)).isoformat() and result["status"] == "skipped"
+    assert s3.json(MARKER)["watermark"] == (T0 + timedelta(hours=4)).isoformat() and result["status"] == "skipped" and released(s3)
 
 
 def test_flow_recovers_arn_by_display_name_when_record_has_none(aws):
-    """재시작(ARN 기록 전에 죽음): 표시 이름으로 실행을 찾아 기록에 채우고 이어받는다. start 0회."""
+    """재시작(ARN 기록 전에 죽음): 표시 이름으로 실행을 찾아 기록에 채우고(If-Match) 이어받는다. start 0회."""
     s3, sm, _ = aws
     rec = active_record(arn=None)
     sm.executions = [{"PipelineExecutionArn": "arn-other", "PipelineExecutionDisplayName": "prefect-x"},
@@ -420,50 +489,54 @@ def test_flow_recovers_arn_by_display_name_when_record_has_none(aws):
     sm.statuses, sm.steps = ["Executing", "Succeeded"], STEPS_PASS
     result = run_flow(execute=True, wait=False)
     assert result["status"] == "in_progress" and result["execution_arn"] == ARN and sm.started == []
-    assert s3.json(ACTIVE)["execution_arn"] == ARN and s3.json(ACTIVE)["recovered"]      # 기록 복구
+    assert s3.json(ACTIVE)["execution_arn"] == ARN and s3.json(ACTIVE)["recovered"] and s3.json(ACTIVE)["state"] == "started"   # 기록 복구
     result = run_flow(execute=True)
-    assert result["previous"]["status"] == "Succeeded" and sm.started == [] and ACTIVE not in s3.objects
+    assert result["previous"]["status"] == "Succeeded" and sm.started == [] and released(s3)
 
 
 def test_flow_handles_reservation_without_execution(aws):
-    """예약만 있고 실행이 없을 때: 새 예약이면 다른 프로세스가 시작 중 → 시작 안 함. 오래됐으면 지우고 새로 시작."""
+    """예약만 있고 실행이 없을 때: 새 예약이면 다른 프로세스가 시작 중 → 시작 안 함. 오래됐으면 해제하고 새로 시작."""
     s3, sm, _ = aws
     s3.objects.update({**feedback_objects(5, T0), **artifacts()})
     sm.steps = STEPS_PASS
     s3.objects[ACTIVE] = encoded(active_record(arn=None, reserved_ago=timedelta(seconds=5)))
     result = run_flow(execute=True)
-    assert result["status"] == "in_progress" and result["execution_arn"] is None and sm.started == []
-    s3.objects[ACTIVE] = encoded(active_record(arn=None, reserved_ago=timedelta(hours=3)))   # 시작 전에 죽은 예약
+    assert result["status"] == "in_progress" and result["execution_arn"] is None and sm.started == [] and s3.puts == []
+    stale = active_record(arn=None, reserved_ago=timedelta(hours=3))   # 시작 전에 죽은 예약
+    s3.objects[ACTIVE] = encoded(stale)
     sm.statuses = ["Executing", "Succeeded"]
     result = run_flow(execute=True)
-    assert result["status"] == "Succeeded" and len(sm.started) == 1 and ACTIVE not in s3.objects
+    assert result["status"] == "Succeeded" and len(sm.started) == 1 and released(s3)
+    assert s3.puts[0] == ACTIVE and json.loads(s3.objects[ACTIVE][0])["run_id"] != stale["run_id"]   # 묘비(abandoned) → 새 예약 → … → 새 묘비
     # 기록의 실행이 지워진 경우도 같다
     s3.objects[ACTIVE] = encoded(active_record(arn="arn-deleted", reserved_ago=timedelta(hours=3)))
     sm.missing.add("arn-deleted")
-    assert run_flow(execute=True)["status"] == "skipped" and len(sm.started) == 1 and ACTIVE not in s3.objects
+    assert run_flow(execute=True)["status"] == "skipped" and len(sm.started) == 1 and released(s3)
+    assert s3.json(ACTIVE)["status"] == "abandoned" and s3.json(ACTIVE)["execution_arn"] == "arn-deleted"
 
 
 def test_flow_previous_failed_run_is_cleared_then_retried_once(aws):
-    """이전 실행이 실패로 끝나 있으면: 기록 삭제·기준점 유지 → 같은 데이터로 이번 실행에서 1회 재시도."""
+    """이전 실행이 실패로 끝나 있으면: 기록 해제·기준점 유지 → 같은 데이터로 이번 실행에서 1회 재시도."""
     s3, sm, _ = aws
     s3.objects.update({**feedback_objects(5, T0), **artifacts(), ACTIVE: encoded(active_record())})
     sm.statuses, sm.steps = ["Failed", "Executing", "Succeeded"], STEPS_PASS
     result = run_flow(execute=True)
     assert result["previous"]["status"] == "Failed" and result["status"] == "Succeeded"
     assert len(sm.started) == 1 and result["new_data"]["count"] == 5          # 기준점이 안 바뀌어 같은 5개를 다시 셌다
-    assert s3.puts.count(MARKER) == 1 and ACTIVE not in s3.objects
+    assert s3.puts.count(MARKER) == 1 and released(s3)
 
 
 def test_flow_does_not_start_when_reservation_is_taken_between_read_and_reserve(aws, monkeypatch):
     """읽을 때는 없었는데 예약 직전에 다른 프로세스가 선점(If-None-Match 412) → 시작하지 않는다."""
     s3, sm, _ = aws
     s3.objects.update(feedback_objects(5, T0))
-    real = prefect_flow.write_json_s3
+    real, raced = prefect_flow.write_json_s3, []
 
-    def racing_write(s3_, bucket, key, obj, if_none_match=False):
-        if if_none_match and key == ACTIVE:
-            real(s3_, bucket, key, active_record(arn="arn-racer"), if_none_match=True)   # 다른 프로세스가 먼저
-        return real(s3_, bucket, key, obj, if_none_match=if_none_match)
+    def racing_write(s3_, bucket, key, obj, if_none_match=False, if_match=None):
+        if key == ACTIVE and (if_none_match or if_match) and not raced:
+            raced.append(1)
+            real(s3_, bucket, key, active_record(arn="arn-racer"))   # 다른 프로세스가 먼저
+        return real(s3_, bucket, key, obj, if_none_match=if_none_match, if_match=if_match)
 
     monkeypatch.setattr(prefect_flow, "write_json_s3", racing_write)
     result = run_flow(execute=True)
@@ -471,16 +544,153 @@ def test_flow_does_not_start_when_reservation_is_taken_between_read_and_reserve(
 
 
 def test_flow_marker_does_not_regress_when_older_run_finishes_later(aws):
-    """기준점 보호: 더 최근 기준점이 이미 저장돼 있으면 늦게 끝난 옛 실행이 그 값을 되돌리지 않는다."""
+    """기준점 보호: 더 최근 기준점이 이미 저장돼 있으면 늦게 끝난 옛 실행이 그 문서를 건드리지 않는다."""
     s3, sm, _ = aws
-    newer = (T0 + timedelta(days=10)).isoformat()
-    s3.objects.update({**artifacts(), MARKER: encoded({"watermark": newer, "version": "skin_v4"}),
-                       ACTIVE: encoded(active_record(watermark=T0 + timedelta(hours=4)))})
+    newer = {"watermark": (T0 + timedelta(days=10)).isoformat(), "version": "skin_v4"}
+    s3.objects.update({**artifacts(), MARKER: encoded(newer), ACTIVE: encoded(active_record(watermark=T0 + timedelta(hours=4)))})
     sm.statuses, sm.steps = ["Succeeded"], STEPS_PASS
     result = run_flow(execute=True)
-    marker = s3.json(MARKER)
-    assert result["previous"]["status"] == "Succeeded" and marker["watermark"] == newer and marker["watermark_kept"] is True
-    assert marker["version"] == "skin_v3" and marker["execution_arn"] == ARN and sm.started == []
+    assert result["previous"]["status"] == "Succeeded" and s3.json(MARKER) == newer and MARKER not in s3.puts and sm.started == []
+    assert released(s3)
+
+
+# ---- 소유권·원자성 (리뷰 Phase 4 재검토 R1) ----
+
+def test_release_and_record_only_touch_own_record(aws):
+    """해제·ARN 기록은 내 run_id 의 살아 있는 기록에만 (If-Match). 남의 기록·묘비는 건드리지 않고 False/현재값."""
+    s3, _, settings = aws
+    mine, theirs = active_record(), active_record()
+    s3.objects[ACTIVE] = encoded(theirs)
+    assert call(prefect_flow.release_active_task, settings, mine, "Succeeded") is False and s3.json(ACTIVE) == theirs and s3.puts == []
+    assert call(prefect_flow.record_active_task, settings, mine, recovered="x") == theirs and s3.puts == []
+    s3.objects[ACTIVE] = encoded(mine)
+    assert call(prefect_flow.record_active_task, settings, mine, recovered="x")["recovered"] == "x" and s3.json(ACTIVE)["run_id"] == mine["run_id"]
+    assert call(prefect_flow.release_active_task, settings, mine, "Succeeded") is True
+    tomb = s3.json(ACTIVE)
+    assert tomb["state"] == "released" and tomb["run_id"] == mine["run_id"] and tomb["status"] == "Succeeded" and tomb["execution_arn"] == ARN
+    assert call(prefect_flow.release_active_task, settings, mine, "Succeeded") is False and s3.json(ACTIVE) == tomb   # 두 번째 해제는 무시
+    s3.delete_object(Bucket="bucket", Key=ACTIVE)
+    assert call(prefect_flow.release_active_task, settings, mine, "Succeeded") is False and ACTIVE not in s3.objects  # 지워졌으면 만들지 않음
+
+
+def test_reserve_over_released_record_is_atomic(aws):
+    """묘비 위 예약은 그 ETag 로 If-Match: 같은 묘비를 읽은 둘 중 하나만 성공한다."""
+    s3, _, settings = aws
+    s3.objects[ACTIVE] = encoded(prefect_flow.released_record(active_record(), "Succeeded"))
+    first, second = (prefect_flow.new_active_record(None, T0, 3, None) for _ in range(2))
+    real_get, raced = s3.get_object, []
+
+    def get_then_first_reserves(Bucket, Key):
+        resp = real_get(Bucket=Bucket, Key=Key)
+        if Key == ACTIVE and not raced:
+            raced.append(1)
+            s3.put_object(Bucket=Bucket, Key=Key, Body=json.dumps(first).encode())   # 다른 프로세스가 같은 묘비 위에 먼저 예약
+        return resp
+    s3.get_object = get_then_first_reserves
+    assert call(prefect_flow.reserve_run_task, settings, second) is False          # 내 If-Match 는 412 → 다시 읽으니 살아 있는 기록
+    assert s3.json(ACTIVE)["run_id"] == first["run_id"] and s3.puts.count(ACTIVE) == 1
+    s3.get_object = real_get
+    assert call(prefect_flow.reserve_run_task, settings, second) is False          # 살아 있는 기록 위에는 예약 못 함
+    s3.objects[ACTIVE] = encoded(prefect_flow.released_record(first, "Failed"))
+    assert call(prefect_flow.reserve_run_task, settings, second) is True and s3.json(ACTIVE)["run_id"] == second["run_id"]
+
+
+def test_write_marker_retries_on_conflict_and_stays_monotonic(aws):
+    """기준점 CAS: 읽은 뒤 다른 프로세스가 더 최근 기준점을 쓰면 내 쓰기는 412 → 다시 읽어 더 최근 값을 유지한다."""
+    s3, _, settings = aws
+    s3.objects[MARKER] = encoded({"watermark": T0.isoformat(), "version": "skin_v2"})
+    newer = {"watermark": (T0 + timedelta(days=3)).isoformat(), "version": "skin_v4"}
+    doc = prefect_flow.marker_document(T0 + timedelta(hours=4), 5, ARN, {"status": "Succeeded", "passed": True, "register": {"version": "skin_v3"}})
+    real_get, raced = s3.get_object, []
+
+    def get_then_other_writes(Bucket, Key):
+        resp = real_get(Bucket=Bucket, Key=Key)
+        if Key == MARKER and not raced:
+            raced.append(1)
+            s3.put_object(Bucket=Bucket, Key=Key, Body=json.dumps(newer).encode())
+        return resp
+    s3.get_object = get_then_other_writes
+    uri, current = call(prefect_flow.write_marker_task, settings, doc)
+    assert uri is None and current == newer and s3.json(MARKER) == newer and s3.puts.count(MARKER) == 1   # 내 쓰기 없음
+    # 반대로 다른 프로세스가 더 옛 기준점을 썼으면 내 값이 이긴다 (재시도 후 성공)
+    raced.clear()
+    s3.objects[MARKER] = encoded({"watermark": T0.isoformat(), "version": "skin_v2"})
+    newer.update(watermark=(T0 - timedelta(days=3)).isoformat())
+    uri, current = call(prefect_flow.write_marker_task, settings, doc)
+    assert uri == f"s3://bucket/{MARKER}" and current == doc and s3.json(MARKER)["watermark"] == doc["watermark"]
+    assert raced and s3.puts.count(MARKER) == 3   # 남의 쓰기(옛 값) → 내 412 → 재시도 성공
+
+
+def test_flow_late_finisher_does_not_release_next_reservation(aws, monkeypatch):
+    """교차 실행(R1): A·B 가 같은 끝난 실행 X 를 이어받는다. B 가 먼저 마무리·해제하고 새 실행 Y 를 예약·시작한 뒤
+    A 가 늦게 마무리해도 Y 의 예약은 그대로다 → C 는 Y 를 이어받고 start 는 Y 1회뿐."""
+    s3, sm, _ = aws
+    x = active_record(watermark=T0 + timedelta(hours=1), new_files=2)   # X 기준점 T0+1h → 마무리 뒤 신규 f2~f4 = 3개 ≥ 최소 3
+    s3.objects.update({**feedback_objects(5, T0), **artifacts(), ACTIVE: encoded(x)})
+    sm.statuses, sm.steps = ["Succeeded", "Succeeded", "Executing"], STEPS_PASS   # A·B 의 X describe, 그 뒤 Y 는 Executing
+    real_summarize, state = prefect_flow.summarize_task, {}
+
+    def summarize_then_b_finishes(settings, arn, status):
+        if "b" not in state:                      # A 가 X 를 요약하는 사이 B 가 X 마무리 → 해제 → 신규 3개 → Y 예약·시작
+            state["b"] = None
+            state["b"] = run_flow(execute=True, wait=False)
+        return real_summarize(settings, arn, status)
+    monkeypatch.setattr(prefect_flow, "summarize_task", summarize_then_b_finishes)
+
+    a = run_flow(execute=True, wait=False)
+    b = state["b"]
+    assert b["previous"]["status"] == "Succeeded" and b["status"] == "started" and len(sm.started) == 1
+    y_arn, y_token = b["execution_arn"], sm.started[0]["ClientRequestToken"]
+    active = s3.json(ACTIVE)
+    assert active["state"] == "started" and active["run_id"] == y_token and active["execution_arn"] == y_arn   # A 가 Y 예약을 지우지 않았다
+    assert a["previous"]["status"] == "Succeeded" and a["status"] == "in_progress" and a["execution_arn"] == y_arn
+    assert s3.json(MARKER)["watermark"] == (T0 + timedelta(hours=1)).isoformat()   # X 기준점 (Y 는 아직 안 끝남)
+    c = run_flow(execute=True, wait=False)
+    assert c["status"] == "in_progress" and c["execution_arn"] == y_arn and len(sm.started) == 1
+    assert s3.json(ACTIVE)["run_id"] == y_token
+
+
+# ---- dry-run 은 읽기만 (리뷰 Phase 4 재검토 R2) ----
+
+def test_dry_run_is_read_only_for_every_active_state(aws, monkeypatch):
+    """execute=False: 진행 중 / 끝남 / ARN 없는 예약(복구 가능·불가) 어느 경우에도 S3 쓰기·삭제·대기·시작이 없다."""
+    s3, sm, _ = aws
+    monkeypatch.setattr(prefect_flow, "wait_pipeline", lambda *a, **k: pytest.fail("dry-run 이 완료를 기다렸다"))
+    s3.objects.update({**feedback_objects(5, T0), **artifacts()})
+    sm.steps = STEPS_PASS
+
+    def read_only(result):
+        assert result["status"] == "dry_run" and s3.puts == [] and s3.deletes == [] and sm.started == [] and MARKER not in s3.objects
+        return result
+
+    # 진행 중 (기본 wait=True 여도 기다리지 않는다)
+    running = active_record()
+    s3.objects[ACTIVE], sm.statuses = encoded(running), ["Executing"]
+    r = read_only(run_flow())
+    assert r["active"]["execution_status"] == "Executing" and r["active"]["run_id"] == running["run_id"]
+    assert r["plan"][0].startswith("진행 중 실행") and r["plan"][-1] == "위 처리 뒤 신규 데이터가 기준 이상이면 예약 → 시작"
+    # 끝났지만 마무리 안 됨 → 기준점 저장·해제를 하지 않는다
+    sm.statuses = ["Succeeded"]
+    r = read_only(run_flow())
+    assert r["active"]["execution_status"] == "Succeeded" and r["plan"][0].startswith("끝난 실행") and "기준점 저장" in r["plan"][0]
+    assert s3.json(ACTIVE) == running
+    # ARN 없는 오래된 예약, 실행도 못 찾음 → 해제하지 않는다
+    stale = active_record(arn=None, reserved_ago=timedelta(hours=3))
+    s3.objects[ACTIVE] = encoded(stale)
+    r = read_only(run_flow())
+    assert r["active"]["execution_status"] is None and r["plan"][0].startswith("실행 없는 예약") and s3.json(ACTIVE) == stale
+    # ARN 없지만 표시 이름으로 찾을 수 있음 → 결과에는 보여 주되 기록에 쓰지 않는다
+    rec = active_record(arn=None)
+    sm.executions, sm.statuses = [{"PipelineExecutionArn": ARN, "PipelineExecutionDisplayName": rec["display_name"]}], ["Executing"]
+    s3.objects[ACTIVE] = encoded(rec)
+    r = read_only(run_flow())
+    assert r["active"]["execution_arn"] == ARN and s3.json(ACTIVE) == rec and s3.json(ACTIVE)["execution_arn"] is None
+    # 묘비 + 기준 미달: active 없음, 계획은 "시작하지 않음"
+    s3.objects[ACTIVE] = encoded(prefect_flow.released_record(rec, "Succeeded"))
+    s3.objects[MARKER] = encoded({"watermark": (T0 + timedelta(hours=3)).isoformat()})
+    s3.puts.clear()
+    r = run_flow()
+    assert r["status"] == "dry_run" and "active" not in r and r["plan"] == ["신규 1개 < 최소 3개 → 시작하지 않음"] and s3.puts == []
 
 
 # ---- CLI check ----
@@ -491,4 +701,8 @@ def test_check_command_reports_marker_and_active(aws, capsys):
     assert prefect_flow.check_command(settings, None) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["count"] == 5 and out["enough"] is True and out["active"]["execution_arn"] == ARN and out["marker"] is None
+    assert out["last_released"] is None
+    s3.objects[ACTIVE] = encoded(prefect_flow.released_record(active_record(), "Succeeded"))
     assert prefect_flow.check_command(settings, "2030-01-01T00:00:00Z") == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["active"] is None and out["last_released"]["status"] == "Succeeded" and s3.puts == []
