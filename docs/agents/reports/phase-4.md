@@ -114,6 +114,40 @@
 2. 산출물 경로의 실행 ID가 ARN 마지막 조각과 같은지 (`pipeline-artifacts/<name>/<id>/evaluation/evaluation.json`).
 3. 플로우 자격증명 권한: `sagemaker:StartPipelineExecution/DescribePipelineExecution/ListPipelineExecutionSteps`, S3 `feedback/` 목록·`pipeline-artifacts/` 읽기·`prefect/last_run.json` 쓰기.
 
+## Codex 리뷰 반영 (1회차, 2026-10-30)
+
+리뷰 `docs/agents/reviews/phase-4.md`: Major 1건 — 진행 중 실행이 있어도 같은 데이터로 다시 부르면 별도 SageMaker 실행을 시작한다(`--no-wait`·대기 시간 초과·재시작 뒤 복구 없음, 기준점 후퇴 보호 없음). **AWS 호출 없음** — 전부 boto3 대역.
+
+### 변경 파일 (`git diff f609140 --stat`: 6파일 +507/-86)
+
+| 파일 | 내용 |
+|---|---|
+| `pipelines/prefect_flow.py` | **예약 기록** `s3://<bucket>/<artifacts>/<name>/prefect/active_run.json`(설정 `new_data.active_key`): 파이프라인 start **전에** `put_object(IfNoneMatch="*")`로 원자적 생성 → 이미 있으면 시작하지 않고 `in_progress` 반환. 내용 = `run_id`(uuid4 hex 32자 = SageMaker `ClientRequestToken`, 멱등 키)·`display_name`(`prefect-<UTC시각>-<run_id 8자>`)·`execution_arn`·`reserved/started/owner`·그때의 `since/watermark/new_files/parameters`. start 직후 ARN을 기록. **이어받기**: 플로우 시작 시 기록이 있으면 `describe_pipeline_execution` → 진행 중이면 대기(`wait=False`면 `in_progress`), 끝났으면 요약 로그 → `Succeeded`면 기준점 저장 → 기록 삭제 → 그 다음 신규 데이터를 **새 기준점으로 다시 센다**(결과 `previous`에 이전 실행 요약). ARN 기록 전에 죽은 경우 `list_pipeline_executions`에서 표시 이름으로 ARN 복구(`recovered` 표시), 실행이 없으면 예약이 `reserve_stale_seconds`(10분)보다 오래됐을 때만 삭제(더 새 예약은 다른 프로세스가 시작 중일 수 있어 `in_progress`). 실행이 삭제된 ARN(`ResourceNotFound`)도 같은 처리. **기준점 보호** `merge_marker`: 기존 watermark가 더 최근이면 유지(`watermark_kept: true`). **정책**: `--force`는 최소 건수만 무시(진행 중 실행 있으면 새로 시작 안 함); 실패·중단 종료 시 기록 삭제·기준점 유지 → 다음 실행(스케줄·수동)이 같은 데이터로 1회 재시도, 플로우는 실패로 끝남; 대기 시간 초과 시 기록 유지 + 경고 로그 → 다음 실행이 이어받음. `serve`에 `global_limit=1`(Prefect 쪽 보조). `check` 출력에 `active` 추가 |
+| `configs/prefect.yaml` | `new_data.active_key: prefect/active_run.json`, `new_data.reserve_stale_seconds: 600` 추가, 주석 보강 |
+| `tests/test_prefect_flow.py` | 12 → **25개**. 대역 확장: `FakeS3.put_object(IfNoneMatch)` 412·`delete_object`, `FakeSageMaker.list_pipeline_executions`(2페이지)·삭제된 실행. 순수 함수 4개(토큰·표시 이름 규격, 원자적 예약·해제, 표시 이름 검색·삭제된 실행, `merge_marker`). 플로우 "중복 실행 방지" 8개: 완료 전 중복 호출(+`force`) → `in_progress`·start 1회 → `--no-wait` 후 재호출이 이어받아 기준점 저장·해제·`skipped`; 대기 시간 초과 → `TimeoutError`, 기록 유지 → 다음 호출이 마무리(start 1회); 재시작(기록에 ARN 있음) → start 0회; 재시작(ARN 없음) → 표시 이름으로 복구·기록 갱신; 예약만 있음(새 예약 → 시작 안 함 / 오래된 예약 → 삭제 후 1회 시작 / 실행 삭제됨 → 삭제 후 계속); 이전 실행 `Failed` → 정리 후 같은 5개로 1회 재시도; 읽기–예약 사이 선점(412) → 시작 안 함; 더 최근 기준점이 있으면 옛 실행 마무리가 되돌리지 않음. `check` CLI 테스트 1개. **fixture가 Prefect 임시 서버를 띄울 수 없으면(샌드박스 소켓 bind 금지) 태스크를 `.fn`으로 바꿔 같은 플로우 함수를 돈다** — 리뷰 환경에서 5개 error 나던 문제 대응 |
+| `pipelines/README.md`, `configs/README.md` | "중복 실행 방지"·"실패 후 재시도 정책" 절, 필요한 권한(`ListPipelineExecutions`, `active_run.json` 쓰기·삭제) 추가 |
+| `docs/agents/mlops-plan.md`, `docs/agents/reviews/phase-4.md` | 진행 현황 비고, 리뷰 항목 반영 표시 |
+
+금지 경로 변경 0줄(`git diff main --name-status -- serving common models Dockerfile requirements.txt .dockerignore .env.example tests` → 신규 `A` 4개만). `git diff main --stat` 누적: 57 files changed, 5702 insertions(+) (`pipelines/prefect_flow.py` 512줄, `tests/test_prefect_flow.py` 494줄, `configs/prefect.yaml` 24줄, `pipelines/README.md` 72줄).
+
+### 검증
+
+| 검증 | 결과 |
+|---|---|
+| `pyflakes pipelines training scripts common tests/test_prefect_flow.py tests/test_pipeline_steps.py` | 통과 |
+| `pytest -q` 전체 (Prefect 임시 서버) | **57 passed** (기존 32 + Phase 4 25), 32초 |
+| `tests/test_prefect_flow.py` 서버 없는 모드 (`prefect_test_harness.__enter__`가 `PermissionError`를 내도록 바꿔 샌드박스 재현) | **25 passed**, 0.09초 — fixture가 태스크를 `.fn`으로 바꿔 Prefect 엔진 없이 같은 플로우 함수 실행 |
+| 리뷰의 중복 실행 재현 (동일 데이터 `execute=True, wait=False` 연속 2회) | start 요청 **1회**, 두 번째는 `in_progress`(같은 ARN). `force=True`로 세 번째 호출도 `in_progress`. 이어서 `wait=True` 호출 → 이어받아 `Succeeded` 요약·기준점 저장(watermark = 그때 센 파일 최근 시각, `new_files 5`)·기록 삭제 → 신규 0 → `skipped` |
+| CLI 종단 (대역 + Prefect 임시 서버): `check` → `run --execute --no-wait --param Epochs=2` → `run --execute --no-wait` → `run --execute` → `check` | start 요청에 `ClientRequestToken`(기록 `run_id`와 같음)·`PipelineExecutionDisplayName prefect-20261030-…`; 두 번째 run은 `in_progress` + `active` 기록 출력; 세 번째는 "이전 실행 이어받음 … 상태 Executing" 로그 → 요약 → 기준점 저장 → 해제 → `skipped`; S3 쓰기 순서 `active_run.json`(예약) → `active_run.json`(ARN) → `last_run.json`, 삭제 `active_run.json` 1회, 끝나면 `active` 없음 |
+| CLI `serve` (호출 가로채기) | `flow.serve(name="weekly", schedule=Cron("0 3 * * 1", timezone="Asia/Seoul"), parameters={"execute": True}, paused=True, global_limit=1, …)`; Prefect 3.9.0 `Flow.serve`에 `global_limit` 인자 있음 확인 |
+| SageMaker API 규격 (botocore 모델) | `StartPipelineExecution.ClientRequestToken` 32~128자 idempotencyToken, `PipelineExecutionDisplayName` ≤82자 `[a-zA-Z0-9](-*[a-zA-Z0-9])*`; `ListPipelineExecutions` 요약에 `PipelineExecutionDisplayName`·`PipelineExecutionArn` 포함; S3 `PutObject.IfNoneMatch` 지원 |
+
+### 설계 메모
+
+- 예약은 **파이프라인 단위 단일 실행**이다(데이터가 달라도 진행 중 실행이 있으면 시작 안 함) — 같은 기준 모델에서 두 학습이 동시에 돌면 Register 버전 번호 경합과 낭비가 생기기 때문. 새 데이터는 진행 중 실행이 끝난 뒤 같은 플로우 실행이 바로 다시 센다.
+- `ClientRequestToken`은 데이터에서 유도하지 않고 예약마다 새로 만든다(uuid4). 데이터 기반 토큰이면 실패 후 재시도가 SageMaker 멱등성 때문에 **실패한 옛 실행을 돌려받을** 위험이 있다. 예약 기록이 원자적이므로 토큰의 영속성은 기록이 담당한다.
+- 실제 AWS에서만 확인할 것(기존 3개에 추가): S3 버킷이 `If-None-Match` 조건부 쓰기를 지원하는지(2024-08 이후 모든 리전 일반 버킷 지원), `list_pipeline_executions` 요약의 `PipelineExecutionDisplayName`이 start 때 준 값으로 들어오는지.
+
 ## 질문
 
 없음

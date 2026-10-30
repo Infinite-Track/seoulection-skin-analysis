@@ -10,6 +10,6 @@
 | `splits/` | 고정 테스트셋 person_id 목록 (한 줄에 하나, `#` 주석). Phase 2 `make_splits.py`가 만든다 | `training.dataset.load_rows`, `pipelines/steps/prepare.py`·`evaluate.py` (테스트셋 대조) |
 | `pipeline.yaml` | SageMaker 파이프라인: 이름, 컨테이너 버전, 인스턴스, Spot, 현재 운영 모델, 신규 데이터 최소 건수, 비교 축, 버전 접두사 | `pipelines/sagemaker_pipeline.py`, `pipelines/steps/*` (기본값) |
 | `train_pipeline.yaml` | 파이프라인 Training 단계의 학습 설정 (데이터셋 `train` = Prepare 출력, 시작점 = `SM_CHANNEL_BASE_MODEL`) | `training.train` (컨테이너 안) |
-| `prefect.yaml` | Prefect 주간 플로우: 플로우·배포 이름, cron(월 03:00 KST)·시간대, 신규 데이터 소스·최소 건수(환경변수 `MIN_NEW_FEEDBACK_FILES` 우선)·기준점 파일, 완료 대기 간격·상한 | `pipelines/prefect_flow.py` |
+| `prefect.yaml` | Prefect 주간 플로우: 플로우·배포 이름, cron(월 03:00 KST)·시간대, 신규 데이터 소스·최소 건수(환경변수 `MIN_NEW_FEEDBACK_FILES` 우선)·기준점 파일·진행 중 실행 기록 파일(중복 시작 방지)·예약 만료 시간, 완료 대기 간격·상한 | `pipelines/prefect_flow.py` |
 
 비밀값(키·계정 ID)은 넣지 않는다. 역할 ARN은 환경변수 `SAGEMAKER_ROLE_ARN`.

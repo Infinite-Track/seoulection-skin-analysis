@@ -34,21 +34,23 @@ python -m pipelines.sagemaker_pipeline start --param Epochs=2 --param MinFeedbac
 **자동 배포 없음** — Register가 `PendingManualApproval`로 올리는 데서 끝나고 승인·배포는 사람이 한다. 플로우는 boto3 `sagemaker`(start·describe·list steps)와 `s3`만 쓴다.
 
 - **신규 데이터 확인**은 `new_data.py` 인터페이스(`NewDataSource.check(since) → NewDataReport`). 현재 `s3_feedback`: S3 `feedback/`에서 지난 실행 기준점 이후 올라온 파일 수. 최소 건수는 환경변수 `MIN_NEW_FEEDBACK_FILES`(없으면 `prefect.yaml new_data.min_new_files`). 추천 서버 count·export API 연동은 `RecommendServerSource`에 TODO로만 있다.
-- **기준점(watermark)**: `s3://<bucket>/pipeline-artifacts/<name>/prefect/last_run.json`의 `watermark`(그때 센 파일 중 가장 최근 `LastModified`). 파이프라인이 `Succeeded`로 끝났을 때만 갱신한다 — 실패하면 다음 주에 같은 데이터를 다시 센다. Condition 불통과는 `Succeeded`(정상 종료)라 기준점이 갱신된다.
-- **결과 로그**: 단계별 상태, Condition `Outcome`, `evaluation.json`(점수·실패 축), `register.json`(새 버전 `skin_vN`, S3, Model Package ARN). 실행이 `Failed`/`Stopped`면 플로우도 실패로 끝난다. 대기 상한(`wait.timeout_seconds`, 16h)을 넘으면 플로우만 실패하고 실행은 그대로 둔다.
+- **기준점(watermark)**: `s3://<bucket>/pipeline-artifacts/<name>/prefect/last_run.json`의 `watermark`(그때 센 파일 중 가장 최근 `LastModified`). 파이프라인이 `Succeeded`로 끝났을 때만 갱신한다 — 실패하면 다음 주에 같은 데이터를 다시 센다. Condition 불통과는 `Succeeded`(정상 종료)라 기준점이 갱신된다. 기존 watermark가 더 최근이면 뒤로 되돌리지 않는다.
+- **중복 실행 방지** (`prefect/active_run.json`): 파이프라인을 시작하기 전에 이 기록을 `If-None-Match: *`로 만든다(원자적, 하나만 성공). 기록에는 `run_id`(= SageMaker `ClientRequestToken`, 멱등 키), 실행 표시 이름, 실행 ARN, 그때의 기준점·신규 건수·파라미터가 들어간다. 플로우는 시작할 때 이 기록이 있으면 **새로 시작하지 않고 그 실행을 이어받는다**: 진행 중이면 대기(`--no-wait`면 `in_progress`로 끝), 끝났으면 결과 로그·기준점 저장·기록 삭제 뒤 신규 데이터를 다시 센다. 그래서 `--no-wait` 뒤 재호출, 대기 시간 초과 뒤 다음 주 실행, 프로세스 재시작, 같은 시각 중복 호출 모두 start는 1회다. ARN을 기록하기 전에 죽었으면 표시 이름으로 실행 목록에서 찾고, 그래도 없으면 예약이 `reserve_stale_seconds`(10분)보다 오래됐을 때만 지우고 새로 간다. `--force`는 최소 건수만 무시한다 — 진행 중 실행이 있으면 force여도 새로 시작하지 않는다.
+- **실패 후 재시도 정책**: 실행이 `Failed`/`Stopped`로 끝나면 기록을 지우고 기준점은 그대로 둔다 → 다음 실행(다음 주 스케줄 또는 수동 `run --execute`)이 같은 데이터로 다시 시도한다. 즉시 재시도는 사람이 `run --execute`로 한다. 플로우 자체는 실패로 끝난다.
+- **결과 로그**: 단계별 상태, Condition `Outcome`, `evaluation.json`(점수·실패 축), `register.json`(새 버전 `skin_vN`, S3, Model Package ARN). 실행이 `Failed`/`Stopped`면 플로우도 실패로 끝난다. 대기 상한(`wait.timeout_seconds`, 16h)을 넘으면 플로우만 실패하고 실행·`active_run.json`은 그대로 둔다(다음 실행이 이어받는다).
 
 ```bash
 pip install -r requirements.txt -r requirements-pipeline.txt          # prefect>=3.9 포함. 워커 PC에는 sagemaker SDK가 없어도 플로우는 돈다
 export MIN_NEW_FEEDBACK_FILES=50                                       # 선택. 없으면 prefect.yaml 값(1)
-python -m pipelines.prefect_flow check [--since 2026-10-01T00:00:00Z]  # 신규 데이터 수만 (S3 읽기, Prefect 없이). 기준 이상이면 0, 미만이면 3
+python -m pipelines.prefect_flow check [--since 2026-10-01T00:00:00Z]  # 신규 데이터 수·기준점·진행 중 실행 기록 (S3 읽기, Prefect 없이). 기준 이상이면 0, 미만이면 3
 python -m pipelines.prefect_flow run                                   # 로컬 1회 — 기본 dry-run: 확인까지만, 시작하지 않음
 python -m pipelines.prefect_flow run --execute [--force] [--param Epochs=2 --param MinFeedbackCrops=0] [--no-wait]   # 실제 시작 (사람이 실행)
 python -m pipelines.prefect_flow serve [--paused] [--cron "0 3 * * 1" --timezone Asia/Seoul]   # 스케줄 배포 등록 + 실행 프로세스 (계속 떠 있음)
 ```
 
-`serve`는 Prefect 3의 `flow.serve`(워크 풀 없이 이 프로세스가 스케줄을 실행)로 배포 `seoulection-skin-weekly-retrain/weekly`를 만들고 `execute=True`로 돈다.
+`serve`는 Prefect 3의 `flow.serve`(워크 풀 없이 이 프로세스가 스케줄을 실행)로 배포 `seoulection-skin-weekly-retrain/weekly`를 만들고 `execute=True`, `global_limit=1`(같은 배포의 플로우 실행 동시 1개 — 보조 장치, 본체는 위 `active_run.json`)로 돈다.
 `PREFECT_API_URL`이 없으면 로컬 임시 서버를 쓴다 — 상시 운영은 Prefect 서버/Cloud를 가리키고 `serve`를 systemd 등으로 띄운다. cron을 바꾸면 `prefect.yaml`을 고치고 `serve`를 다시 띄운다.
-플로우를 돌리는 자격증명에 필요한 권한: `sagemaker:StartPipelineExecution/DescribePipelineExecution/ListPipelineExecutionSteps`, S3 `feedback/` 목록, `pipeline-artifacts/` 읽기 + `prefect/last_run.json` 쓰기.
+플로우를 돌리는 자격증명에 필요한 권한: `sagemaker:StartPipelineExecution/DescribePipelineExecution/ListPipelineExecutions/ListPipelineExecutionSteps`, S3 `feedback/` 목록, `pipeline-artifacts/` 읽기 + `prefect/last_run.json`·`prefect/active_run.json` 쓰기·삭제.
 
 ## 단계 스크립트 로컬 실행 (SageMaker 없이)
 
