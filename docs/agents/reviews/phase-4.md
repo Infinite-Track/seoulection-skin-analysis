@@ -47,3 +47,31 @@ VERDICT: FAIL
 ### Claude에게 전달할 수정 요청 (우선순위 순)
 1. R1: 완료 처리와 예약 해제를 실행 소유권에 결합해 이전 호출이 새 예약을 삭제하지 못하도록 한다. marker 갱신도 동시성 아래 단조 증가를 보장하고 교차 실행으로 검증한다. — ✅ 반영 (2026-10-30). 위 R1 반영 칸 참고. 전체 pytest(Prefect 임시 서버) **62 passed**, 서버 없는 모드 `tests/test_prefect_flow.py` **30 passed**
 2. R2: dry-run의 읽기 전용 경로를 active 복구·정리보다 앞에서 분리하고, active 상태별 부작용 없음 테스트를 추가한다. — ✅ 반영 (2026-10-30). 위 R2 반영 칸 참고. `pipelines/README.md` "dry-run은 읽기만" 절·권한 문구(삭제 권한 불필요, dry-run·check는 읽기 권한만) 갱신
+
+
+## 재검토 (2회차)
+
+### 요약
+수정 필요 — Critical 0건, Major 1건. 이전 R1(늦은 완료 처리의 예약 소유권·기준점 CAS)과 R2(dry-run 읽기 전용)는 반영을 확인했다. 그러나 만료 예약 회수와 지연된 시작 사이의 경쟁에서 중복 실행이 가능하다. 현재 판정은 FAIL이다.
+
+### 실행한 검증
+- `git diff main --stat`, `git diff main`, `git diff main --name-status`, `git diff main --numstat` 실행. 전체 diff 출력은 도구 한도로 잘려 Phase 4 구현·설정·테스트·README는 별도로 읽고 `docs/agents/mlops-plan.md` Phase 4와 대조했다.
+- `git diff main --name-status -- serving common models Dockerfile requirements.txt .dockerignore .env.example tests`: 신규 common 파일 2개와 신규 테스트 파일 2개만 A. 금지된 기존 파일 변경 없음.
+- `PYTHONDONTWRITEBYTECODE=1 PREFECT_HOME=/tmp/phase4-review3-prefect PREFECT_SERVER_ANALYTICS_ENABLED=false AWS_EC2_METADATA_DISABLED=true .venv/bin/python -m pytest -q -p no:cacheprovider`: **62 passed in 11.57s**. 기존 테스트도 모두 통과했다. Prefect fixture는 소켓 사용 불가 시 task `.fn`으로 대체하므로 이 결과로 Prefect 서버 통합까지 보장하지 않는다.
+- 월 03:00 KST cron과 설정 변경, `MIN_NEW_FEEDBACK_FILES` 우선 적용, 신규 데이터 인터페이스와 추천 서버 TODO, 기준 미달 start 생략, 완료 대기·실패 로그·결과 지표/버전 로그, 수동 CLI, 자동 배포 없음 확인. 이전 R1의 교차 완료·CAS 충돌 테스트와 R2의 active 상태별 읽기 전용 테스트도 위 pytest에 포함되어 통과했다.
+- 추가 재현: `PYTHONDONTWRITEBYTECODE=1 AWS_EC2_METADATA_DISABLED=true .venv/bin/python - <<'PY'`에서 `runpy.run_path('tests/test_prefect_flow.py')`의 FakeS3/FakeSageMaker/SETTINGS/feedback_objects/active_record를 재사용했다. `make_clients`, 설정, 로거를 대역으로 바꾸고 모든 task는 `.fn`으로 교체했다. 아래 순서로 실제 구현을 호출했으며 AWS 호출은 없었다.
+  1. feedback 5개와 `statuses=['Executing']` 대역 생성. A 기록은 `active_record(arn=None, reserved_ago=timedelta(hours=3))`로 생성한다. 이는 A가 예약 후 설정된 600초보다 오래 정지한 상황을 표현한다.
+  2. `reserve_run_task(SETTINGS, old)` → True (A 예약).
+  3. `weekly_retrain.fn(execute=True, wait=False)` → B가 오래된 A 예약을 해제하고 새 토큰으로 시작한다.
+  4. `start_pipeline_task(SETTINGS, None, old)` → 정지했던 A가 재개하여 자신의 옛 토큰으로 별도 실행을 시작한다.
+  5. 실측: `{'B_status': 'started', 'start_requests': 2, 'distinct_tokens': 2, 'active_tracks_B': True, 'A_execution_untracked': True}`. B는 Executing인 상태이고 A 실행 ARN은 active 기록에 남지 않는다.
+- Phase 4 변경은 학습·export 구현 변경이 아니므로 스모크 학습·reference 출력 비교는 반복하지 않았다. `docs/mlops.md`는 아직 없으며 계획상 Phase 5 대상이다. 코드 수정 없이 이 리뷰 파일만 갱신했다.
+
+### 발견 사항
+| # | 심각도 | 파일:줄 | 문제 | 근거 | 수정 제안 | 반영 |
+|---|---|---|---|---|---|---|
+| R3 | Major | `pipelines/prefect_flow.py:408` (`498–504`, `537–542` 관련) | 만료된 예약을 회수한 뒤에도 이전 소유자가 재개하면 별도 SageMaker 실행을 시작한다. 같은 데이터에 대한 동시 실행과 추적되지 않는 실행이 생긴다. | ARN 없는 예약은 나이만으로 해제하고 새 run_id를 만든다. `start_pipeline_task`는 원격 start를 먼저 호출하고 그 뒤 ARN 기록에만 소유권 CAS를 적용한다. 따라서 A 예약 → A 정지 → B 만료 회수·새 토큰 시작 → A 재개 순서에서 토큰이 서로 달라 멱등성이 적용되지 않는다. 위 대역 재현에서 시작 2회와 A ARN 미기록을 확인했다. | 원격 시작이 불확실한 예약은 새 토큰으로 교체하지 말고 영속된 동일 토큰·표시 이름·파라미터로 복구하는 프로토콜을 사용한다. 예를 들어 ARN 없는 예약은 동일 요청으로 start를 재호출하여 SageMaker 멱등성으로 실행을 확보하고, 확실한 종료/시작 거절을 확인한 뒤에만 새 run_id로 재시도한다. 단순 start 직전 소유권 조회만 추가하면 조회 직후 회수되는 경쟁이 남는다. 지연된 소유자의 재개와 원격 요청 진행 중 회수를 교차시킨 테스트를 추가한다. | ✅ 반영 (2026-10-30) — ARN 없는 오래된 예약은 해제하지 않고 **그 예약의 `run_id`(ClientRequestToken)·표시 이름·파라미터 그대로** `start_pipeline_task(settings, record)`로 start를 다시 요청해 실행을 확보하고 이어받는다(요청 인자는 전부 기록에서만 오므로 몇 번 불러도 같은 요청 → 같은 ARN). 멈춰 있던 원래 프로세스가 재개해 자기 토큰으로 start해도 같은 실행. 새 run_id로 가는 경우는 확실한 종료만: 기록된 ARN의 실행이 없음(`locate_active_task` → `(arn, None, False)`, stale이면 `abandoned` 해제) / SageMaker가 start를 확실히 거절(`StartRejected`: ValidationException·ResourceNotFound·ResourceLimitExceeded·AccessDenied… → ARN 없는 내 예약만 `rejected`로 해제 후 예외). 스로틀링·5xx는 예약 유지. 덤으로 `record_active_task`가 소유권을 잃었을 때 남의 기록 대신 내 기록을 돌려주도록 고침(남의 run_id로 마무리하면 그 예약을 해제할 수 있었음). 리뷰 재현 재실행: start 요청 2회지만 **실행 1개·토큰 1종(A의 것)**, 기록 ARN = A의 ARN = B의 ARN, state started |
+
+### Claude에게 전달할 수정 요청 (우선순위 순)
+1. R3: ARN 없는 예약의 시간 만료가 다른 토큰의 실행으로 이어지지 않도록 복구·재시도 규칙을 고친다. 시작 요청의 결과가 불확실할 때는 동일 ClientRequestToken과 동일 요청 인자를 유지한다. — ✅ 반영 (2026-10-30). 위 R3 반영 칸 참고. 규칙은 `pipelines/prefect_flow.py` 모듈 docstring, `pipelines/README.md` "시작 여부가 불확실한 예약" 절, `configs/prefect.yaml reserve_stale_seconds` 주석에 명시
+2. FakeSageMaker가 동일 ClientRequestToken 요청을 실제 멱등성처럼 처리하도록 하고, A 예약/정지 → B 복구 → A 재개와 start 요청 응답 지연 상황에서 원격 실행 1개·기록 ARN 일치를 검증한다. 전체 pytest를 다시 실행한다. — ✅ 반영 (2026-10-30). `FakeSageMaker`: 토큰별 ARN 기억(같은 토큰 → 같은 ARN, 실행 수 `created` 불변), `reject` 코드로 거절 흉내. 테스트 4개 추가: A 예약/정지 → B 복구(같은 토큰 start) → A 재개(실행 1개·토큰 1종·기록 ARN 일치·마무리까지) / A의 start는 닿았지만 응답 지연(ARN 미기록) → B 표시 이름으로 이어받음 → A 재개 같은 ARN / B의 start 응답 대기 중 C가 복구(실행 1개·같은 ARN·같은 run_id) / 거절 처리 6단계(본 경로 거절→rejected 해제→다음은 새 run_id, 스로틀링→예약 유지→같은 토큰 이어받기, ARN 있는 기록은 거절에도 불변, 복구 중 거절→그 예약만 rejected). 기존 테스트 3개 보강(멱등 start·StartRejected, 오래된 예약은 같은 토큰으로 이어받음·지워진 실행만 abandoned·새 예약은 불변, dry-run에 지워진 ARN 경우). 전체 pytest(Prefect 임시 서버) **66 passed**, 서버 없는 모드 `tests/test_prefect_flow.py` **34 passed**

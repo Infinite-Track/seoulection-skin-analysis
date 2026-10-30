@@ -14,7 +14,11 @@
   시작하지 않는다. 기록에는 state·ClientRequestToken(run_id)·표시 이름·실행 ARN·그때의 기준점이 들어가고, 플로우가 시작할 때 진행 중 기록이 있으면
   그 실행을 **이어받는다**(ARN describe → 진행 중이면 대기, 끝났으면 결과 로그·기준점 저장·기록 해제 후 신규 데이터를 다시 센다).
   --no-wait·대기 시간 초과·프로세스 재시작 뒤에도 같은 실행을 이어받고, start 는 한 번만 일어난다.
-  ARN을 쓰기 전에 죽었으면 표시 이름으로 실행 목록에서 찾고, 그래도 없으면(reserve_stale_seconds 지난 뒤) 예약을 해제하고 새로 간다.
+- 시작 여부가 불확실한 예약(ARN 없음): ARN을 쓰기 전에 죽었거나 멈춘 경우. 먼저 표시 이름으로 실행 목록에서 찾고, 그래도 없으면
+  reserve_stale_seconds 가 지난 뒤 **그 예약의 run_id(ClientRequestToken)·표시 이름·파라미터 그대로 start 를 다시 요청**해 실행을 확보한다
+  (SageMaker 멱등성: 원래 요청이 이미 닿았으면 같은 실행 ARN, 아니면 새 실행 1개). 새 run_id 로 바꾸지 않으므로 멈춰 있던 원래 프로세스가
+  재개해 자기 토큰으로 start 해도 같은 실행이 돌아온다 — 실행은 1개만 생긴다. 새 run_id 로 다시 가는 경우는 확실한 종료만:
+  기록된 실행 ARN 이 더는 없거나(지워짐), SageMaker 가 start 를 확실히 거절(ValidationException 등 → 예약 해제 status=rejected)한 때.
 - 소유권: 기록을 바꾸는 모든 쓰기(ARN 기록·해제·예약)는 "읽은 run_id 가 같고 ETag 가 그대로일 때만"(`If-Match`) 이루어진다 — 같은 실행을
   여러 호출이 이어받아 마무리해도, 먼저 끝낸 호출이 해제하고 새 실행을 예약한 뒤 늦은 호출이 그 새 예약을 건드리지 못한다(412 → 다시 읽고
   run_id 가 다르면 손을 뗀다). 기록은 지우지 않고 state=released 묘비로 남긴다(조건부 삭제 대신 조건부 덮어쓰기). 기준점(last_run.json)도
@@ -169,10 +173,22 @@ def owns(record, run_id):
     return is_active(record) and record.get("run_id") == run_id
 
 
+class StartRejected(RuntimeError):
+    """SageMaker 가 시작 요청을 **확실히** 거절했다(실행이 생기지 않았다) — 요청 내용·권한·한도 문제. 이 예약은 해제해도 된다.
+
+    네트워크 오류·스로틀링·5xx 는 여기 들어가지 않는다(실행이 생겼는지 모름 → 예약을 그대로 두고 같은 토큰으로 다시 시도).
+    """
+
+
+REJECTED_CODES = ("ValidationException", "ResourceNotFound", "ResourceNotFoundException", "ResourceLimitExceeded",
+                  "AccessDeniedException", "ResourceInUse")
+
+
 def start_pipeline(sm, name, parameters=None, display_name=None, client_request_token=None):
     """파이프라인 실행 시작 → 실행 ARN. parameters: {이름: 값} (파이프라인 파라미터 덮어쓰기).
 
-    client_request_token(32~128자)은 SageMaker 쪽 멱등 키 — 같은 토큰으로 다시 부르면 새 실행을 만들지 않는다.
+    client_request_token(32~128자)은 SageMaker 쪽 멱등 키 — 같은 토큰(같은 요청)으로 다시 부르면 새 실행을 만들지 않고 같은 ARN 을 돌려준다.
+    확실한 거절(파이프라인 없음·요청 오류·권한·한도)은 StartRejected, 그 밖(스로틀링·5xx)은 ClientError 그대로.
     """
     request = dict(PipelineName=name,
                    PipelineExecutionDisplayName=display_name or f"prefect-{now_utc():%Y%m%d-%H%M%S}")
@@ -183,8 +199,11 @@ def start_pipeline(sm, name, parameters=None, display_name=None, client_request_
     try:
         return sm.start_pipeline_execution(**request)["PipelineExecutionArn"]
     except ClientError as e:
-        if e.response["Error"]["Code"] in ("ResourceNotFound", "ResourceNotFoundException"):
-            raise RuntimeError(f"파이프라인 {name!r}이 없다 — 먼저 `python -m pipelines.sagemaker_pipeline upsert`") from e
+        code = e.response["Error"]["Code"]
+        if code in ("ResourceNotFound", "ResourceNotFoundException"):
+            raise StartRejected(f"파이프라인 {name!r}이 없다 — 먼저 `python -m pipelines.sagemaker_pipeline upsert`") from e
+        if code in REJECTED_CODES:
+            raise StartRejected(f"파이프라인 {name!r} 시작 거절 {code}: {e.response['Error'].get('Message')}") from e
         raise
 
 
@@ -349,7 +368,8 @@ def read_active_task(settings):
 def locate_active_task(settings, active):
     """기록의 실행을 찾는다 (읽기만) → (arn, status, recovered). ARN이 기록에 없으면 표시 이름으로 실행 목록에서 찾는다(recovered=True).
 
-    실행이 없거나 지워졌으면 (None, None, False).
+    - 기록에 ARN 이 있는데 그 실행이 없다(지워짐) → (arn, None, False): 시작은 확실히 끝났고 실행만 없다.
+    - ARN 도 없고 표시 이름으로도 못 찾음 → (None, None, False): 시작했는지 불확실 (예약만 있음).
     """
     _, sm = make_clients(settings["region"])
     arn, recovered = active.get("execution_arn"), False
@@ -361,27 +381,40 @@ def locate_active_task(settings, active):
     if not arn:
         return None, None, False
     status = describe_status(sm, arn)
-    return (arn, status, recovered) if status else (None, None, False)
+    if status is None:
+        return (None, None, False) if recovered else (arn, None, False)
+    return arn, status, recovered
 
 
 @task(name="record-active", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
 def record_active_task(settings, active, **fields):
-    """내 기록(run_id 같고 살아 있음)에만 필드를 덧붙인다 — 읽은 ETag 로 If-Match. 돌려주는 값: 쓴 기록, 소유권이 없으면 현재 기록."""
+    """내 기록(run_id 같고 살아 있음)에만 필드를 덧붙인다 — 읽은 ETag 로 If-Match.
+
+    돌려주는 값: 쓴 기록. 소유권이 없으면(다른 호출이 해제·재예약) S3 기록이 아니라 **내가 들고 있던 기록**(+필드)을 돌려준다 —
+    남의 run_id 를 들고 마무리하면 그 예약을 해제해 버릴 수 있기 때문.
+    """
     s3, _ = make_clients(settings["region"])
     run_id = active["run_id"]
-    written, current = update_json_s3(s3, settings["bucket"], settings["active_key"],
-                                      lambda cur: dict(cur, **fields) if owns(cur, run_id) else None)
-    return written or current
+    written, _ = update_json_s3(s3, settings["bucket"], settings["active_key"],
+                                lambda cur: dict(cur, **fields) if owns(cur, run_id) else None)
+    return written or dict(active, **fields)
+
+
+def release_record(s3, settings, run_id, status, only_unstarted=False):
+    """내 기록(run_id 같고 살아 있음)만 released 묘비로 바꾼다(If-Match) → True. only_unstarted=True 면 ARN 이 기록되지 않은 때만."""
+    def decide(cur):
+        if not owns(cur, run_id) or (only_unstarted and cur.get("execution_arn")):
+            return None
+        return released_record(cur, status)
+    written, _ = update_json_s3(s3, settings["bucket"], settings["active_key"], decide)
+    return written is not None
 
 
 @task(name="release-active", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
 def release_active_task(settings, active, status):
     """내 기록만 released 묘비로 바꾼다(If-Match). 다른 호출이 먼저 해제했거나 새 예약이 들어왔으면(run_id 다름) 건드리지 않고 False."""
     s3, _ = make_clients(settings["region"])
-    run_id = active["run_id"]
-    written, _ = update_json_s3(s3, settings["bucket"], settings["active_key"],
-                                lambda cur: released_record(cur, status) if owns(cur, run_id) else None)
-    return written is not None
+    return release_record(s3, settings, active["run_id"], status)
 
 
 @task(name="check-new-data", retries=2, retry_delay_seconds=30, cache_policy=NO_CACHE)
@@ -402,12 +435,24 @@ def reserve_run_task(settings, record):
 
 
 @task(name="start-pipeline", cache_policy=NO_CACHE)
-def start_pipeline_task(settings, parameters, record):
-    """예약 기록의 표시 이름·토큰으로 시작하고, 내 기록에 ARN·state=started 를 채운다(If-Match)."""
+def start_pipeline_task(settings, record, **fields):
+    """예약 기록의 run_id(ClientRequestToken)·표시 이름·파라미터 **그대로** 시작을 요청하고, 내 기록에 ARN·state=started 를 채운다(If-Match).
+
+    요청 인자는 전부 기록에서 오므로 같은 기록으로 몇 번을 불러도 같은 요청이다 → SageMaker 멱등성으로 같은 실행 ARN 이 돌아오고
+    실행은 1개만 생긴다 (예약 뒤 멈춘 프로세스가 재개해도, 그 사이 다른 호출이 이 예약을 이어받아 시작했어도). 기록이 이미 남의 것이면
+    (run_id 다름) 기록은 건드리지 않는다. SageMaker 가 확실히 거절하면(StartRejected) 실행이 없으므로 ARN 없는 내 예약을 해제(status=rejected)하고
+    예외를 그대로 올린다 — 다음 실행이 새 run_id 로 간다. 불확실한 오류(스로틀링·5xx)는 예약을 그대로 둔다.
+    """
     s3, sm = make_clients(settings["region"])
-    arn = start_pipeline(sm, settings["pipeline"], parameters, display_name=record["display_name"], client_request_token=record["run_id"])
+    run_id = record["run_id"]
+    try:
+        arn = start_pipeline(sm, settings["pipeline"], record.get("parameters"), display_name=record["display_name"], client_request_token=run_id)
+    except StartRejected:
+        release_record(s3, settings, run_id, "rejected", only_unstarted=True)
+        raise
     update_json_s3(s3, settings["bucket"], settings["active_key"],
-                   lambda cur: dict(cur, state="started", execution_arn=arn, started=iso(now_utc())) if owns(cur, record["run_id"]) else None)
+                   lambda cur: dict(cur, state="started", execution_arn=arn, started=cur.get("started") or iso(now_utc()), **fields)
+                   if owns(cur, run_id) else None)
     return arn
 
 
@@ -463,8 +508,11 @@ def _dry_run_plan(active, status, report, min_new_files, force):
         steps.append(f"진행 중 실행 {active.get('execution_arn') or active.get('display_name')}({status}) 을 이어받아 완료까지 대기")
     elif active and status:
         steps.append(f"끝난 실행 {active.get('execution_arn')}({status}) 마무리: 결과 로그 → {'기준점 저장 → ' if status == 'Succeeded' else ''}예약 해제 → 신규 데이터 다시 세기")
+    elif active and active.get("execution_arn"):
+        steps.append(f"기록된 실행 {active['execution_arn']} 이 없다(지워짐): 예약이 reserve_stale_seconds 지났으면 해제, 아니면 시작하지 않음")
     elif active:
-        steps.append(f"실행 없는 예약({active.get('owner')}, {active.get('reserved')}) 확인: reserve_stale_seconds 지났으면 해제, 아니면 시작하지 않음")
+        steps.append(f"실행 없는 예약({active.get('owner')}, {active.get('reserved')}) 확인: reserve_stale_seconds 지났으면 "
+                     "같은 run_id(ClientRequestToken)·표시 이름·파라미터로 시작을 다시 요청해 실행 확보(멱등), 아니면 시작하지 않음")
     if report.count < min_new_files and not force:
         steps.append(f"신규 {report.count}개 < 최소 {min_new_files}개 → 시작하지 않음")
     elif active:
@@ -495,25 +543,36 @@ def weekly_retrain(execute: bool = False, force: bool = False, since: str | None
             result["active"] = dict(active, execution_arn=arn or active.get("execution_arn"), execution_status=active_status)
             log.info("dry-run: 예약 기록 있음 (run_id %s, 실행 %s, 상태 %s, 예약 %s, %s) — 읽기만 한다",
                      active.get("run_id"), arn or "없음", active_status or "없음", active.get("reserved"), active.get("owner"))
-        elif arn is None:
-            age = (now_utc() - (parse_time(active.get("reserved")) or now_utc())).total_seconds()
-            if age < settings["reserve_stale_seconds"]:
-                log.info("다른 프로세스가 %s 전에 예약하고 시작 중이다(%s) → 이번에는 시작하지 않는다", f"{age:.0f}초", active.get("owner"))
-                return dict(result, status="in_progress", execution_arn=None, active=active)
-            log.warning("예약만 있고 실행이 없다(%s, %.0f초 전) → 예약을 해제하고 계속한다", active.get("owner"), age)
-            release_active_task(settings, active, "abandoned")
         else:
-            if recovered:
-                active = record_active_task(settings, active, execution_arn=arn, state="started", recovered=iso(now_utc()))
-            log.info("이전 실행 이어받음 %s (상태 %s, 예약 %s, 기준점 %s, 신규 %s개)",
-                     arn, active_status, active.get("reserved"), active.get("since") or "없음", active.get("new_files"))
-            status = active_status
-            if status not in TERMINAL:
-                if not wait:
+            if active_status is None:   # 실행을 못 찾음: 예약만 있음(시작했는지 불확실) 또는 기록된 실행이 지워짐(확실한 종료)
+                age = (now_utc() - (parse_time(active.get("reserved")) or now_utc())).total_seconds()
+                if age < settings["reserve_stale_seconds"]:
+                    log.info("다른 프로세스가 %s 전에 예약하고 시작 중이다(%s) → 이번에는 시작하지 않는다", f"{age:.0f}초", active.get("owner"))
                     return dict(result, status="in_progress", execution_arn=arn, active=active)
-                status = wait_pipeline_task(settings, arn)   # TimeoutError 면 기록을 남겨 다음 실행이 다시 이어받는다
-            result["previous"] = _finish(settings, log, active, arn, status,
-                                         parse_time(active.get("watermark")) or parse_time(active.get("since")), active.get("new_files"))
+                if arn:
+                    log.warning("기록된 실행 %s 이 없다(지워짐; %s, %.0f초 전) → 예약을 해제하고 계속한다", arn, active.get("owner"), age)
+                    release_active_task(settings, active, "abandoned")
+                else:
+                    # 새 run_id 로 바꾸지 않는다: 원래 프로세스가 재개해 자기 토큰으로 start 해도 같은 실행이 돌아와야 한다
+                    log.warning("예약만 있고 실행을 찾지 못했다(%s, %.0f초 전) → 같은 run_id·표시 이름·파라미터로 시작을 다시 요청해 "
+                                "실행을 확보한다 (멱등: 이미 시작됐으면 그 실행, 아니면 새 실행 1개)", active.get("owner"), age)
+                    arn = start_pipeline_task(settings, active, adopted=iso(now_utc()), adopted_by=owner_tag())
+                    arn, active_status, _ = locate_active_task(settings, dict(active, execution_arn=arn))
+                    if active_status is None:
+                        raise RuntimeError(f"시작 요청으로 받은 실행 {arn} 을 describe 할 수 없다 — 기록(run_id {active.get('run_id')})은 그대로 둔다")
+                    active = dict(active, execution_arn=arn, state="started")
+            elif recovered:
+                active = record_active_task(settings, active, execution_arn=arn, state="started", recovered=iso(now_utc()))
+            if active_status is not None:
+                log.info("이전 실행 이어받음 %s (상태 %s, 예약 %s, 기준점 %s, 신규 %s개)",
+                         arn, active_status, active.get("reserved"), active.get("since") or "없음", active.get("new_files"))
+                status = active_status
+                if status not in TERMINAL:
+                    if not wait:
+                        return dict(result, status="in_progress", execution_arn=arn, active=active)
+                    status = wait_pipeline_task(settings, arn)   # TimeoutError 면 기록을 남겨 다음 실행이 다시 이어받는다
+                result["previous"] = _finish(settings, log, active, arn, status,
+                                             parse_time(active.get("watermark")) or parse_time(active.get("since")), active.get("new_files"))
 
     # 2) 신규 데이터 확인
     marker = None if since else read_marker_task(settings)
@@ -539,7 +598,7 @@ def weekly_retrain(execute: bool = False, force: bool = False, since: str | None
         other = read_active_task(settings) or {}
         log.info("다른 실행이 예약을 선점했다(%s, 실행 %s) → 이번에는 시작하지 않는다", other.get("owner"), other.get("execution_arn") or "시작 중")
         return dict(result, status="in_progress", execution_arn=other.get("execution_arn"), active=other)
-    arn = start_pipeline_task(settings, parameters, record)
+    arn = start_pipeline_task(settings, record)   # 확실한 거절(StartRejected)이면 예약을 해제하고 예외 → 다음 실행은 새 run_id
     log.info("파이프라인 %s 시작: %s (표시 이름 %s, 파라미터 %s)", settings["pipeline"], arn, record["display_name"], parameters or {})
     if not wait:
         return dict(result, status="started", execution_arn=arn)

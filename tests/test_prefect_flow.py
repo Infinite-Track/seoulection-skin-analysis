@@ -85,17 +85,30 @@ class FakeS3:
 
 
 class FakeSageMaker:
-    """statuses 는 describe 마다 앞에서 하나씩 소비(마지막 값은 유지). started 는 start 요청 목록, executions 는 list 결과."""
+    """statuses 는 describe 마다 앞에서 하나씩 소비(마지막 값은 유지). started 는 start **요청** 목록, executions 는 list 결과(= 생긴 실행).
+
+    ClientRequestToken 멱등성: 같은 토큰의 start 요청은 새 실행을 만들지 않고 처음 받은 ARN 을 돌려준다(요청은 started 에 남는다).
+    reject 에 오류 코드를 넣으면 start 가 그 ClientError 를 낸다(실행 없음).
+    """
 
     def __init__(self, statuses=("Executing", "Executing", "Succeeded"), steps=(), exists=True, executions=()):
         self.statuses, self.steps, self.exists = list(statuses), list(steps), exists
         self.started, self.executions, self.missing = [], list(executions), set()
+        self.tokens, self.created, self.reject = {}, 0, None
 
     def start_pipeline_execution(self, **request):
         if not self.exists:
             raise s3_error("ResourceNotFound", "StartPipelineExecution")
+        if self.reject:
+            raise s3_error(self.reject, "StartPipelineExecution")
         self.started.append(request)
-        arn = ARN if len(self.started) == 1 else f"{ARN}-{len(self.started)}"
+        token = request.get("ClientRequestToken")
+        if token in self.tokens:
+            return {"PipelineExecutionArn": self.tokens[token]}
+        self.created += 1
+        arn = ARN if self.created == 1 else f"{ARN}-{self.created}"
+        if token:
+            self.tokens[token] = arn
         self.executions.insert(0, {"PipelineExecutionArn": arn, "PipelineExecutionDisplayName": request.get("PipelineExecutionDisplayName"),
                                    "PipelineExecutionStatus": "Executing"})
         return {"PipelineExecutionArn": arn}
@@ -230,8 +243,19 @@ def test_start_pipeline_passes_parameters_token_and_explains_missing_pipeline():
     prefect_flow.start_pipeline(sm, "p", None)
     assert "PipelineParameters" not in sm.started[1] and "ClientRequestToken" not in sm.started[1]
     assert sm.started[1]["PipelineExecutionDisplayName"].startswith("prefect-")
-    with pytest.raises(RuntimeError, match="upsert"):
+    # 같은 토큰으로 다시 부르면 같은 ARN, 실행은 늘지 않는다 (대역이 SageMaker 멱등성을 흉내낸다)
+    assert prefect_flow.start_pipeline(sm, "p", {"Epochs": 2, "MinFeedbackCrops": "0"}, display_name="x", client_request_token=token) == ARN
+    assert len(sm.started) == 3 and sm.created == 2 and len(sm.executions) == 2
+    with pytest.raises(prefect_flow.StartRejected, match="upsert"):
         prefect_flow.start_pipeline(FakeSageMaker(exists=False), "p")
+    rejecting = FakeSageMaker()
+    rejecting.reject = "ValidationException"
+    with pytest.raises(prefect_flow.StartRejected, match="ValidationException"):
+        prefect_flow.start_pipeline(rejecting, "p")
+    rejecting.reject = "ThrottlingException"                      # 불확실한 오류는 그대로 ClientError
+    with pytest.raises(ClientError):
+        prefect_flow.start_pipeline(rejecting, "p")
+    assert issubclass(prefect_flow.StartRejected, RuntimeError)
 
 
 def test_active_record_is_valid_token_and_display_name():
@@ -502,17 +526,28 @@ def test_flow_handles_reservation_without_execution(aws):
     s3.objects[ACTIVE] = encoded(active_record(arn=None, reserved_ago=timedelta(seconds=5)))
     result = run_flow(execute=True)
     assert result["status"] == "in_progress" and result["execution_arn"] is None and sm.started == [] and s3.puts == []
-    stale = active_record(arn=None, reserved_ago=timedelta(hours=3))   # 시작 전에 죽은 예약
+    # 오래된 예약(시작 전에 멈춤·죽음): 새 run_id 가 아니라 **그 예약의 토큰·표시 이름·파라미터 그대로** start 를 다시 보내 실행을 확보하고 이어받는다
+    stale = active_record(arn=None, reserved_ago=timedelta(hours=3), parameters={"Epochs": "2"})
     s3.objects[ACTIVE] = encoded(stale)
     sm.statuses = ["Executing", "Succeeded"]
     result = run_flow(execute=True)
-    assert result["status"] == "Succeeded" and len(sm.started) == 1 and released(s3)
-    assert s3.puts[0] == ACTIVE and json.loads(s3.objects[ACTIVE][0])["run_id"] != stale["run_id"]   # 묘비(abandoned) → 새 예약 → … → 새 묘비
-    # 기록의 실행이 지워진 경우도 같다
+    assert result["previous"]["status"] == "Succeeded" and result["status"] == "skipped" and len(sm.started) == 1 and released(s3)
+    req = sm.started[0]
+    assert req["ClientRequestToken"] == stale["run_id"] and req["PipelineExecutionDisplayName"] == stale["display_name"]
+    assert req["PipelineParameters"] == [{"Name": "Epochs", "Value": "2"}]
+    tomb = s3.json(ACTIVE)
+    assert tomb["run_id"] == stale["run_id"] and tomb["execution_arn"] == ARN and tomb["status"] == "Succeeded"
+    assert s3.json(MARKER)["watermark"] == stale["watermark"]                       # 기준점은 그 예약이 셌던 값
+    # 기록된 실행이 지워진 경우(확실한 종료)만 해제(abandoned)하고 새로 간다
     s3.objects[ACTIVE] = encoded(active_record(arn="arn-deleted", reserved_ago=timedelta(hours=3)))
     sm.missing.add("arn-deleted")
     assert run_flow(execute=True)["status"] == "skipped" and len(sm.started) == 1 and released(s3)
     assert s3.json(ACTIVE)["status"] == "abandoned" and s3.json(ACTIVE)["execution_arn"] == "arn-deleted"
+    # 지워진 실행이라도 예약이 새 것이면 건드리지 않는다
+    fresh = active_record(arn="arn-deleted", reserved_ago=timedelta(seconds=5))
+    s3.objects[ACTIVE], s3.puts[:] = encoded(fresh), []
+    result = run_flow(execute=True)
+    assert result["status"] == "in_progress" and result["execution_arn"] == "arn-deleted" and s3.puts == [] and s3.json(ACTIVE) == fresh
 
 
 def test_flow_previous_failed_run_is_cleared_then_retried_once(aws):
@@ -562,7 +597,8 @@ def test_release_and_record_only_touch_own_record(aws):
     mine, theirs = active_record(), active_record()
     s3.objects[ACTIVE] = encoded(theirs)
     assert call(prefect_flow.release_active_task, settings, mine, "Succeeded") is False and s3.json(ACTIVE) == theirs and s3.puts == []
-    assert call(prefect_flow.record_active_task, settings, mine, recovered="x") == theirs and s3.puts == []
+    # 소유권이 없으면 남의 기록이 아니라 내 기록을 돌려준다 (남의 run_id 를 들고 마무리하면 그 예약을 해제해 버린다)
+    assert call(prefect_flow.record_active_task, settings, mine, recovered="x") == dict(mine, recovered="x") and s3.puts == []
     s3.objects[ACTIVE] = encoded(mine)
     assert call(prefect_flow.record_active_task, settings, mine, recovered="x")["recovered"] == "x" and s3.json(ACTIVE)["run_id"] == mine["run_id"]
     assert call(prefect_flow.release_active_task, settings, mine, "Succeeded") is True
@@ -650,6 +686,112 @@ def test_flow_late_finisher_does_not_release_next_reservation(aws, monkeypatch):
     assert s3.json(ACTIVE)["run_id"] == y_token
 
 
+# ---- 예약 복구는 같은 토큰으로 (리뷰 Phase 4 재검토 R3) ----
+
+def test_stale_reservation_is_adopted_with_same_token_and_resumed_owner_gets_same_execution(aws):
+    """리뷰 R3 재현: A 예약(ARN 없음) → A 멈춤(10분 초과) → B 가 복구 → A 재개해 자기 토큰으로 start.
+    B 는 새 run_id 를 만들지 않고 A 의 토큰·표시 이름·파라미터 그대로 start 하므로 A 의 start 도 같은 실행을 받는다 → 실행 1개, 기록 ARN 일치."""
+    s3, sm, settings = aws
+    s3.objects.update({**feedback_objects(5, T0), **artifacts()})
+    sm.statuses, sm.steps = ["Executing"], STEPS_PASS
+    old = active_record(arn=None, reserved_ago=timedelta(hours=3), parameters={"Epochs": "2"})   # A 의 예약
+    assert call(prefect_flow.reserve_run_task, settings, old) is True
+    b = run_flow(execute=True, wait=False)                                      # B: 오래된 예약 → 같은 토큰으로 start → 이어받음
+    assert b["status"] == "in_progress" and b["execution_arn"] == ARN and len(sm.started) == 1 and sm.created == 1
+    rec = s3.json(ACTIVE)
+    assert rec["run_id"] == old["run_id"] and rec["execution_arn"] == ARN and rec["state"] == "started" and rec["adopted_by"]
+    a_arn = call(prefect_flow.start_pipeline_task, settings, old)               # A 재개: 자기(같은) 토큰으로 start
+    assert a_arn == ARN and len(sm.started) == 2 and sm.created == 1 and len(sm.executions) == 1
+    assert sm.started[0]["ClientRequestToken"] == sm.started[1]["ClientRequestToken"] == old["run_id"]
+    assert sm.started[0]["PipelineParameters"] == sm.started[1]["PipelineParameters"] == [{"Name": "Epochs", "Value": "2"}]
+    assert sm.started[0]["PipelineExecutionDisplayName"] == sm.started[1]["PipelineExecutionDisplayName"] == old["display_name"]
+    rec = s3.json(ACTIVE)
+    assert rec["execution_arn"] == ARN and rec["run_id"] == old["run_id"] and rec["state"] == "started"   # A 의 실행도 기록된 그 ARN
+    sm.statuses = ["Executing", "Succeeded"]                                    # 마무리: 어느 호출이 끝내도 실행은 1개
+    done = run_flow(execute=True)
+    assert done["previous"]["status"] == "Succeeded" and done["status"] == "skipped" and sm.created == 1 and released(s3)
+    assert s3.json(ACTIVE)["run_id"] == old["run_id"] and s3.json(MARKER)["watermark"] == old["watermark"]
+
+
+def test_resumed_owner_after_delayed_start_response_joins_same_execution(aws):
+    """A 의 start 요청은 SageMaker 에 닿아 실행이 생겼지만 응답이 늦어 ARN 을 기록하지 못한 상태.
+    B 는 새 예약이라도 표시 이름으로 실행을 찾아 이어받고(start 없음), 뒤늦게 A 가 start 결과를 처리해도 같은 ARN 이다."""
+    s3, sm, settings = aws
+    s3.objects.update({**feedback_objects(5, T0), **artifacts()})
+    sm.statuses, sm.steps = ["Executing"], STEPS_PASS
+    rec = active_record(arn=None, reserved_ago=timedelta(minutes=1))
+    assert call(prefect_flow.reserve_run_task, settings, rec) is True
+    sm.start_pipeline_execution(PipelineName=settings["pipeline"], PipelineExecutionDisplayName=rec["display_name"],
+                                ClientRequestToken=rec["run_id"])                # A 의 요청이 SageMaker 에 닿음
+    b = run_flow(execute=True, wait=False)
+    assert b["status"] == "in_progress" and b["execution_arn"] == ARN and len(sm.started) == 1 and sm.created == 1
+    assert s3.json(ACTIVE)["execution_arn"] == ARN and s3.json(ACTIVE)["recovered"] and s3.json(ACTIVE)["state"] == "started"
+    assert call(prefect_flow.start_pipeline_task, settings, rec) == ARN            # A 재개(같은 요청 재전송) → 같은 ARN
+    assert len(sm.started) == 2 and sm.created == 1
+    after = s3.json(ACTIVE)
+    assert after["execution_arn"] == ARN and after["run_id"] == rec["run_id"] and after["recovered"] and after["state"] == "started"
+
+
+def test_recovery_while_start_response_is_in_flight_keeps_single_execution(aws, monkeypatch):
+    """B 의 start 요청이 처리된 뒤 응답이 오기 전에 C 가 돈다: C 는 ARN 없는 예약을 표시 이름으로 찾아 기록하고,
+    B 의 늦은 ARN 기록은 같은 run_id 라 그 위에 쓴다 → 실행 1개, 같은 ARN."""
+    s3, sm, _ = aws
+    s3.objects.update({**feedback_objects(5, T0), **artifacts()})
+    sm.statuses, sm.steps = ["Executing"], STEPS_PASS
+    monkeypatch.setattr(prefect_flow, "start_pipeline_task", getattr(prefect_flow.start_pipeline_task, "fn", prefect_flow.start_pipeline_task))
+    real_start, state = prefect_flow.start_pipeline, {}
+
+    def start_then_c_runs(sm_, name, parameters=None, display_name=None, client_request_token=None):
+        arn = real_start(sm_, name, parameters, display_name=display_name, client_request_token=client_request_token)
+        if "c" not in state:
+            state["c"] = None
+            state["c"] = run_flow(execute=True, wait=False)
+        return arn
+    monkeypatch.setattr(prefect_flow, "start_pipeline", start_then_c_runs)
+    b = run_flow(execute=True, wait=False)
+    c = state["c"]
+    assert b["status"] == "started" and c["status"] == "in_progress" and b["execution_arn"] == c["execution_arn"] == ARN
+    assert len(sm.started) == 1 and sm.created == 1
+    rec = s3.json(ACTIVE)
+    assert rec["execution_arn"] == ARN and rec["state"] == "started" and rec["run_id"] == sm.started[0]["ClientRequestToken"] and rec["recovered"]
+
+
+def test_rejected_start_releases_only_unstarted_own_reservation(aws):
+    """확실한 거절(ValidationException 등)만 예약을 rejected 로 해제 → 다음 실행은 새 run_id. 불확실한 오류(스로틀링)는 예약 유지 →
+    다음 실행이 같은 토큰으로 다시 시도. 이미 ARN 이 기록된(시작된) 기록은 거절이 와도 건드리지 않는다."""
+    s3, sm, settings = aws
+    s3.objects.update({**feedback_objects(5, T0), **artifacts()})
+    sm.steps = STEPS_PASS
+    sm.reject = "ValidationException"                                          # 1) 본 경로: 거절 → 해제(rejected) + 플로우 실패, 실행 0
+    with pytest.raises(prefect_flow.StartRejected, match="ValidationException"):
+        run_flow(execute=True)
+    tomb = s3.json(ACTIVE)
+    assert tomb["state"] == "released" and tomb["status"] == "rejected" and tomb["execution_arn"] is None and sm.created == 0
+    sm.reject, sm.statuses = None, ["Executing", "Succeeded"]                  # 2) 다음 실행은 새 run_id
+    assert run_flow(execute=True)["status"] == "Succeeded" and sm.created == 1 and sm.started[0]["ClientRequestToken"] != tomb["run_id"]
+    s3.objects.update(feedback_objects(3, T0 + timedelta(days=1)))
+    sm.reject = "ThrottlingException"                                           # 3) 불확실한 오류 → 예약 그대로
+    with pytest.raises(ClientError):
+        run_flow(execute=True)
+    kept = s3.json(ACTIVE)
+    assert kept["state"] == "reserved" and kept["execution_arn"] is None and sm.created == 1
+    stale_kept = dict(kept, reserved=(datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(timespec="seconds"))
+    s3.objects[ACTIVE], sm.reject, sm.statuses = encoded(stale_kept), None, ["Executing", "Succeeded"]
+    result = run_flow(execute=True)                                             # 4) 그 예약을 같은 토큰으로 이어받는다
+    assert result["previous"]["status"] == "Succeeded" and sm.started[-1]["ClientRequestToken"] == kept["run_id"] and sm.created == 2
+    assert s3.json(ACTIVE)["run_id"] == kept["run_id"] and released(s3)
+    started = active_record()                                                   # 5) 이미 시작된(ARN 있는) 기록은 거절이 와도 그대로
+    s3.objects[ACTIVE], sm.reject = encoded(started), "ValidationException"
+    with pytest.raises(prefect_flow.StartRejected):
+        call(prefect_flow.start_pipeline_task, settings, started)
+    assert s3.json(ACTIVE) == started
+    stale = active_record(arn=None, reserved_ago=timedelta(hours=3))           # 6) ARN 없는 오래된 예약 복구 중 거절 → 그 예약만 rejected
+    s3.objects[ACTIVE] = encoded(stale)
+    with pytest.raises(prefect_flow.StartRejected):
+        run_flow(execute=True)
+    assert s3.json(ACTIVE)["status"] == "rejected" and s3.json(ACTIVE)["run_id"] == stale["run_id"] and sm.created == 2
+
+
 # ---- dry-run 은 읽기만 (리뷰 Phase 4 재검토 R2) ----
 
 def test_dry_run_is_read_only_for_every_active_state(aws, monkeypatch):
@@ -674,11 +816,18 @@ def test_dry_run_is_read_only_for_every_active_state(aws, monkeypatch):
     r = read_only(run_flow())
     assert r["active"]["execution_status"] == "Succeeded" and r["plan"][0].startswith("끝난 실행") and "기준점 저장" in r["plan"][0]
     assert s3.json(ACTIVE) == running
-    # ARN 없는 오래된 예약, 실행도 못 찾음 → 해제하지 않는다
+    # ARN 없는 오래된 예약, 실행도 못 찾음 → 같은 토큰으로 start 를 다시 보내지 않는다 (계획에만 적는다)
     stale = active_record(arn=None, reserved_ago=timedelta(hours=3))
     s3.objects[ACTIVE] = encoded(stale)
     r = read_only(run_flow())
-    assert r["active"]["execution_status"] is None and r["plan"][0].startswith("실행 없는 예약") and s3.json(ACTIVE) == stale
+    assert r["active"]["execution_status"] is None and r["plan"][0].startswith("실행 없는 예약") and "멱등" in r["plan"][0] and s3.json(ACTIVE) == stale
+    # 기록된 실행이 지워짐 → 해제하지 않는다
+    gone = active_record(arn="arn-deleted", reserved_ago=timedelta(hours=3))
+    sm.missing.add("arn-deleted")
+    s3.objects[ACTIVE] = encoded(gone)
+    r = read_only(run_flow())
+    assert r["active"]["execution_status"] is None and r["active"]["execution_arn"] == "arn-deleted"
+    assert r["plan"][0].startswith("기록된 실행 arn-deleted 이 없다") and s3.json(ACTIVE) == gone
     # ARN 없지만 표시 이름으로 찾을 수 있음 → 결과에는 보여 주되 기록에 쓰지 않는다
     rec = active_record(arn=None)
     sm.executions, sm.statuses = [{"PipelineExecutionArn": ARN, "PipelineExecutionDisplayName": rec["display_name"]}], ["Executing"]

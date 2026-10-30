@@ -182,6 +182,38 @@
 - **남는 창**: 예약 뒤 start까지 10분(`reserve_stale_seconds`) 넘게 멈춘 프로세스의 예약은 다른 프로세스가 `abandoned`로 해제할 수 있다 — 그 뒤 원래 프로세스가 start하면 기록 소유권을 잃어 ARN을 못 쓰고(`owns` False) 실행만 남는다. 정상 경로에서 예약→start는 수 초이므로 운영 시 기준 10분을 유지하고, 발생하면 `check`로 보고 수동 정리한다.
 - 실제 AWS에서 확인할 것(추가): S3 PutObject `If-Match`가 대상 버킷에서 동작하는지(SSE-KMS 버킷도 ETag는 불투명 값으로 동작), `412`/`409` 오류 코드 문자열이 `PreconditionFailed`/`ConditionalRequestConflict`로 오는지.
 
+## Codex 재검토 2회차 반영 (2026-10-30)
+
+재검토 결과 Major 1건 **R3**: ARN 없는 예약을 나이만으로 해제하고 **새 run_id**로 시작하므로, 예약 뒤 멈춘 원래 프로세스 A가 재개해 자기(옛) 토큰으로 start하면 토큰이 달라 SageMaker 멱등성이 적용되지 않아 실행이 2개 생기고 A의 실행은 기록에 남지 않는다. **AWS 호출 없음** — 전부 boto3 대역 + Prefect 임시 서버.
+
+### 변경 파일 (`git diff 45dc64f --stat`: 7파일, 코드·테스트·설정·README +≈300/-50)
+
+| 파일 | 내용 |
+|---|---|
+| `pipelines/prefect_flow.py` | **복구는 같은 토큰으로**: ARN 없는 오래된 예약(`reserve_stale_seconds` 경과, 표시 이름으로도 못 찾음)은 해제하지 않고 **그 예약의 `run_id`(= `ClientRequestToken`)·표시 이름·파라미터 그대로** start를 다시 요청해 실행을 확보하고 이어받는다(기록에 `adopted`/`adopted_by` 표시). `start_pipeline_task(settings, record, **fields)`는 요청 인자를 **전부 기록에서만** 가져오므로(파라미터 인자 제거) 같은 기록으로 몇 번 불러도 같은 요청 → 같은 ARN, 실행 1개. ARN 기록은 `started` 시각을 보존. **확실한 종료만 새 run_id**: ① 기록된 ARN의 실행이 없음 — `locate_active_task`가 `(arn, None, False)`로 구분해 돌려주고, stale이면 `abandoned` 해제(새 예약이면 `in_progress`) ② SageMaker가 start를 확실히 거절 — 새 예외 `StartRejected(RuntimeError)`(`ValidationException`·`ResourceNotFound`·`ResourceLimitExceeded`·`AccessDeniedException`·`ResourceInUse`; 파이프라인 없음 "upsert" 안내도 이 타입) → `release_record(only_unstarted=True)`로 **ARN 없는 내 예약만** `rejected`로 해제하고 예외를 올림. 스로틀링·5xx 등 불확실한 오류는 예약을 그대로 둬 다음 실행이 같은 토큰으로 재시도. 부수 수정: `record_active_task`가 소유권을 잃었을 때 S3의 남의 기록이 아니라 **내 기록**을 돌려준다(남의 run_id를 들고 `_finish`하면 그 예약을 해제할 수 있었음). `_dry_run_plan` 문구에 "지워진 실행"/"같은 토큰으로 시작 재요청(멱등)" 구분. 모듈 docstring에 규칙 명시 |
+| `configs/prefect.yaml` | `reserve_stale_seconds` 주석: "지운다" → "같은 run_id·표시 이름·파라미터로 start 재요청(멱등)", 새 run_id 조건 |
+| `pipelines/README.md` | "시작 여부가 불확실한 예약(ARN 없음)" 절 추가(복구 프로토콜·확실한 종료 조건·거절 코드·토큰 멱등 창) |
+| `tests/test_prefect_flow.py` | 30 → **34개**. `FakeSageMaker`: `ClientRequestToken` 멱등성(토큰별 ARN 기억, 같은 토큰 → 같은 ARN, `created` 불변, 요청은 `started`에 기록), `reject` 코드로 거절 흉내. **R3 신규 4개**: 리뷰 시나리오(A 예약·정지 3h → B 복구 = A 토큰으로 start → A 재개 start: 요청 2회·실행 1개·토큰 1종·파라미터·표시 이름 동일·기록 ARN 일치 → 마무리까지 실행 1개) / A의 start는 닿았지만 응답 지연(ARN 미기록, 예약 1분) → B가 표시 이름으로 이어받음(start 0) → A 재개 → 같은 ARN·기록 유지 / B의 start 응답 대기 중 C가 돌아 표시 이름으로 복구·기록 → B의 늦은 ARN 기록은 같은 run_id 위에 → 실행 1개 / 거절 6단계(본 경로 거절 → `rejected` 묘비·실행 0 → 다음은 새 run_id로 성공; 스로틀링 → 예약 유지 → stale 뒤 같은 토큰으로 이어받아 성공; ARN 있는 기록은 거절에도 불변; 복구 중 거절 → 그 예약만 `rejected`). **기존 보강**: `start_pipeline` 같은 토큰 재호출 = 같은 ARN·`StartRejected`/스로틀링은 `ClientError`; 오래된 예약 → 같은 토큰·표시 이름·파라미터로 start·묘비 run_id 동일·기준점 = 예약의 watermark, 지워진 실행만 `abandoned`, 새 예약은 불변; `record_active_task` 비소유 시 내 기록 반환; dry-run에 "지워진 ARN" 경우(쓰기 0) |
+| `docs/agents/mlops-plan.md`, `docs/agents/reviews/phase-4.md` | 진행 현황 비고, 재검토 2회차 항목 반영 표시 |
+
+금지 경로 변경 0줄(`git diff main --name-status -- serving common models Dockerfile requirements.txt .dockerignore .env.example tests` → 신규 `A` 4개만).
+
+### 검증
+
+| 검증 | 결과 |
+|---|---|
+| `pyflakes pipelines/prefect_flow.py tests/test_prefect_flow.py` | 0 warnings |
+| `pytest -q` 전체 (Prefect 임시 서버, `PREFECT_HOME=/tmp/...`) | **66 passed** (기존 32 + Phase 4 34), 59초 |
+| `tests/test_prefect_flow.py` 서버 없는 모드 (`prefect_test_harness`가 `PermissionError`를 내도록 바꿔 샌드박스 재현) | **34 passed**, 0.06초 |
+| 리뷰 R3 재현 재실행 (리뷰와 같은 순서: `reserve_run_task(old)` → `weekly_retrain.fn(execute=True, wait=False)` → `start_pipeline_task(settings, old)`, 대역·`.fn`) | `B_status in_progress`, `start_requests 2`, **`executions_created 1`, `distinct_tokens 1`(A의 토큰), `record_arn` = A의 ARN = B의 ARN, `record_run_id_is_A true`, `record_state started`** — 리뷰 때 `start_requests 2 / distinct_tokens 2 / A_execution_untracked`였던 것이 해소 |
+
+### 설계 메모
+
+- **왜 해제 대신 재요청인가**: ARN 없는 예약은 "start가 닿았는지"를 알 수 없다. 해제하고 새 토큰으로 가면 원래 프로세스의 늦은 start와 토큰이 달라 멱등성이 깨진다. 같은 토큰으로 재요청하면 SageMaker가 "이미 있으면 그 실행, 없으면 1개"를 보장하고, 원래 프로세스의 늦은 요청도 같은 실행을 받는다. 이전 보고의 "남는 창(예약 뒤 10분 넘게 멈춘 프로세스)"은 이것으로 닫힌다.
+- **`reserve_stale_seconds`의 의미 변화**: "죽은 것으로 보고 지우는 시간" → "다른 호출이 같은 토큰으로 시작을 대신 요청해도 되는 시간". 재요청은 멱등이라 더 짧아도 안전하지만, 정상 경로의 예약→start(수 초)를 기다려 불필요한 호출을 피하려 10분을 유지했다.
+- **확실한 거절의 범위**는 botocore 오류 코드 목록(`REJECTED_CODES`)으로 좁게 잡았다. 목록 밖(스로틀링·5xx·네트워크)은 "실행이 생겼는지 모름"으로 보고 예약을 유지한다 — 다음 실행이 같은 토큰으로 재시도하니 막히지 않는다. 목록에 없는 4xx가 반복되면 플로우가 매번 같은 오류로 실패하며 `check`의 `active`에 그 예약이 보인다(사람이 기록을 지우면 다음 예약은 `If-None-Match`로 새로 간다).
+- 실제 AWS에서 확인할 것(추가): `StartPipelineExecution`의 `ClientRequestToken` 멱등 창 길이(문서에 명시 없음 — 창을 넘긴 아주 오래된 예약은 표시 이름 검색이 먼저 찾는다), 같은 토큰·같은 인자 재요청이 같은 ARN을 돌려주는지, 거절 오류 코드 문자열(`ValidationException`, `ResourceLimitExceeded`).
+
 ## 질문
 
 없음
