@@ -1,4 +1,4 @@
-VERDICT: FAIL
+VERDICT: PASS
 # Phase 3 검토
 
 ## 요약
@@ -40,3 +40,42 @@ VERDICT: FAIL
 - Spot 재개 경로는 구현돼 있다. 다중 persistent worker의 재개 재현성 잔여 Minor는 기존 `phase-1.md` 재검토에 기록돼 있으며 Phase 3에서 수정되지 않았다. 실제 CUDA/AMP·Spot 중단/재개, 컨테이너 설치, AWS API 수용 여부는 검증하지 않았다.
 - Prefect와 `docs/mlops.md`·신규 테스트 전체는 각각 Phase 4·5 범위로 판단했다. Phase 3 누락으로 집계하지 않았다.
 - 리뷰 파일 외 소스·설정·기존 리뷰·진행 현황은 수정하지 않았다.
+
+
+## 재검토 (1회차)
+
+### 요약
+
+통과 — 기존 Major 3건 해결을 코드와 회귀 테스트로 확인했다. 이번 재검토에서 추가 Critical·Major는 발견하지 않았다. 아래 검증은 2026-10-29, HEAD `6e9eabb` 기준이다. 위 최초 검토 내용은 이력이며, 최신 판정은 첫 줄과 이 섹션을 따른다.
+
+### 실행한 검증
+
+- `git diff main --stat`, `git diff main`, `git diff main --name-status`로 누적 변경 확인. `git diff fefdede HEAD --stat`로 Phase 3 범위(23파일)를 구분했다. 금지 경로의 기존 파일 변경 없음. `common/` 2파일과 `tests/test_pipeline_steps.py`는 신규 파일이다.
+- `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -p no:cacheprovider`: **32 passed, 8.83초**. 기존 24개와 신규 회귀 테스트 8개 통과.
+- `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pyflakes pipelines training tests/test_pipeline_steps.py`: 통과.
+- `git diff fefdede HEAD --check`: 통과.
+- 인라인 Python에서 `botocore.client.BaseClient._make_api_call`을 호출 즉시 예외를 던지도록 차단하고 더미 자격증명·메타데이터 비활성화를 설정한 뒤 `main(['definition', '--dry-run'])` 실행: 정상 종료. 파라미터 8개, Prepare → Train → Evaluate → Condition 정의 생성 확인. Evaluate 인자는 `--axes all --tolerance 0.0`, Condition은 `EvaluationReport.failed_axes == 0`이다. AWS API는 호출하지 않았다.
+- 실제 `verify_model_dir('models/skin_v2')`: 필수 파일 및 SHA256SUMS 검증 통과, reference 최대 절대 차이 **1.430511474609375e-06 < 1e-3**. `ensure_model_files('models/skin_v2')`도 기존 로컬 파일로 통과.
+- 기존 `/tmp/smoke/testset`에 `check_testset(..., 'aihub_kr')`: 고정 목록과 일치하는 **165명, 5,940행, ok 4,564크롭**. 기존 replay 완전성 문제 0건, 테스트 인물 교집합 **0명**.
+- 기존 `/tmp/smoke/out/train`을 실제 `load_rows(..., part='train')`로 로드: **2,685크롭, 102명**. 이번에는 새 스모크 학습·export를 실행하지 않았다.
+
+### 발견 사항 및 기존 요청 해결 확인
+
+| # | 심각도 | 파일:줄 | 문제 / 확인 결과 | 근거 | 수정 제안 |
+|---|---|---|---|---|---|
+| 기존 1 | 해결 | `pipelines/sagemaker_pipeline.py:207`, `pipelines/steps/evaluate.py:60` | 등록 경로가 모든 지표를 비교한다. | 생성된 정의의 `--axes all`, 기본 tolerance 0. 선택 지표 상승/다른 지표 하락 및 MAE 증가를 거절하는 테스트 통과. | 추가 요청 없음. |
+| 기존 2 | 해결 | `pipelines/steps/prepare.py:114`, `pipelines/steps/prepare.py:220` | 동명 feedback 하위 폴더가 분리되고 중복을 거절한다. | 상대 경로 전체를 소스 ID로 사용. 회귀 테스트에서 두 batch1의 PNG 12개·라벨 2행 보존, 중복 소스·덮어쓰기 거절 확인. | 추가 요청 없음. |
+| 기존 3 | 해결 | `pipelines/steps/util.py:25`, `pipelines/steps/evaluate.py:99` | 동명 모델 tar를 별도 디렉터리에 추출한다. | 호출별 `mkdtemp` 및 candidate/baseline 작업 폴더 분리. 실제 tar 두 개의 경로·내용 보존 테스트 통과. | 추가 요청 없음. |
+| R1 | Minor (기존 잔여) | `training/dataset.py:166`, `training/train.py:165` | Phase 1에 기록한 CPU 다중 persistent worker 재개 시 dropout 난수 재현성 한계가 남아 있다. | DataLoader에 전용 generator가 없고 재개 직후 전역 torch RNG를 복원한다. `phase-1.md` 재검토에서 실측한 가중치 차이 4.53e-04의 관련 구현은 그대로다. 이번에 해당 학습을 재실행하지는 않았다. 체크포인트 재개 자체는 구현돼 있다. | Phase 1 잔여 요청대로 모델 RNG와 DataLoader generator를 분리하고 workers=2→2 연속/재개를 비교한다. |
+
+### Claude에게 전달할 수정 요청 (우선순위 순)
+
+1. Phase 3의 기존 Major 3건에 대한 추가 수정 요청 없음.
+2. 기존 Minor R1은 Phase 1 리뷰의 수정 제안을 참고한다.
+
+### 검증 범위와 남은 한계
+
+- 현재 모델 채널을 통한 파인튜닝, replay 병합, 실행별 Spot 체크포인트 경로, S3 기존 버전 탐색 및 `IfNoneMatch="*"`, Model Registry의 `PendingManualApproval`을 코드에서 확인했다. 자동 배포 코드는 없다.
+- 실제 AWS 실행, 컨테이너 의존성 설치, GPU/AMP 및 Spot 중단·재개는 검증하지 않았다. v2 `deploy_model.pt` 로드·재export 호환성은 기존 보류 사항이다. 위 reference 실측은 기존 v2 ONNX 검증이며 새 학습 산출물의 동등성 실측은 아니다.
+- Prefect와 `docs/mlops.md`는 각각 Phase 4·5 범위로 보아 이번 Phase 3 누락으로 집계하지 않았다.
+- 소스·설정은 수정하지 않았으며 이 리뷰 파일만 갱신했다.
