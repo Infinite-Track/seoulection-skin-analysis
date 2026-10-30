@@ -11,7 +11,7 @@
 | 1 | 학습 모듈 | [x] | [x] | 보고서 `docs/agents/reports/phase-1.md` · 리뷰 Major 1·Minor 2 반영, v2 체크포인트 검증은 보류 (2026-10-29) |
 | 2 | 데이터 준비 스크립트 | [x] | [x] | 보고서 `docs/agents/reports/phase-2.md` · 리뷰 Major 2건 반영 (2026-10-29) |
 | 3 | SageMaker 파이프라인 | [x] | [x] | 보고서 `docs/agents/reports/phase-3.md` · 리뷰 Major 3건 반영 (조건 축 all 고정·feedback 소스 ID 상대 경로·tar 분리 추출) · AWS 미호출(dry-run 정의·로컬 단계 스모크) (2026-10-29) |
-| 4 | Prefect 플로우 | [ ] | [ ] | |
+| 4 | Prefect 플로우 | [x] | [ ] | 보고서 `docs/agents/reports/phase-4.md` · Prefect 3.9 `flow.serve` 월 03:00 KST · 신규 데이터 인터페이스 `pipelines/new_data.py` · AWS 미호출(대역 테스트 12개) (2026-10-30) |
 | 5 | 테스트·문서 | [ ] | [ ] | |
 
 ---

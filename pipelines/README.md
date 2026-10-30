@@ -28,6 +28,28 @@ python -m pipelines.sagemaker_pipeline start --param Epochs=2 --param MinFeedbac
 `upsert`는 `common/ training/ configs/ scripts/ pipelines/` + 단계 스크립트 복사본 + `requirements.txt`(= `requirements-container.txt`)를 묶어 S3에 올린다.
 코드를 바꾸면 다시 `upsert`해야 컨테이너에 반영된다.
 
+## Prefect 주간 플로우 (`prefect_flow.py`)
+
+매주 **월요일 03:00 KST**(`configs/prefect.yaml schedule`)에: 신규 데이터 확인 → 기준 미달이면 종료 → 위 파이프라인 `start` → 완료 대기 → 결과 로그(통과 여부·새 버전·지표) → 기준점 저장.
+**자동 배포 없음** — Register가 `PendingManualApproval`로 올리는 데서 끝나고 승인·배포는 사람이 한다. 플로우는 boto3 `sagemaker`(start·describe·list steps)와 `s3`만 쓴다.
+
+- **신규 데이터 확인**은 `new_data.py` 인터페이스(`NewDataSource.check(since) → NewDataReport`). 현재 `s3_feedback`: S3 `feedback/`에서 지난 실행 기준점 이후 올라온 파일 수. 최소 건수는 환경변수 `MIN_NEW_FEEDBACK_FILES`(없으면 `prefect.yaml new_data.min_new_files`). 추천 서버 count·export API 연동은 `RecommendServerSource`에 TODO로만 있다.
+- **기준점(watermark)**: `s3://<bucket>/pipeline-artifacts/<name>/prefect/last_run.json`의 `watermark`(그때 센 파일 중 가장 최근 `LastModified`). 파이프라인이 `Succeeded`로 끝났을 때만 갱신한다 — 실패하면 다음 주에 같은 데이터를 다시 센다. Condition 불통과는 `Succeeded`(정상 종료)라 기준점이 갱신된다.
+- **결과 로그**: 단계별 상태, Condition `Outcome`, `evaluation.json`(점수·실패 축), `register.json`(새 버전 `skin_vN`, S3, Model Package ARN). 실행이 `Failed`/`Stopped`면 플로우도 실패로 끝난다. 대기 상한(`wait.timeout_seconds`, 16h)을 넘으면 플로우만 실패하고 실행은 그대로 둔다.
+
+```bash
+pip install -r requirements.txt -r requirements-pipeline.txt          # prefect>=3.9 포함. 워커 PC에는 sagemaker SDK가 없어도 플로우는 돈다
+export MIN_NEW_FEEDBACK_FILES=50                                       # 선택. 없으면 prefect.yaml 값(1)
+python -m pipelines.prefect_flow check [--since 2026-10-01T00:00:00Z]  # 신규 데이터 수만 (S3 읽기, Prefect 없이). 기준 이상이면 0, 미만이면 3
+python -m pipelines.prefect_flow run                                   # 로컬 1회 — 기본 dry-run: 확인까지만, 시작하지 않음
+python -m pipelines.prefect_flow run --execute [--force] [--param Epochs=2 --param MinFeedbackCrops=0] [--no-wait]   # 실제 시작 (사람이 실행)
+python -m pipelines.prefect_flow serve [--paused] [--cron "0 3 * * 1" --timezone Asia/Seoul]   # 스케줄 배포 등록 + 실행 프로세스 (계속 떠 있음)
+```
+
+`serve`는 Prefect 3의 `flow.serve`(워크 풀 없이 이 프로세스가 스케줄을 실행)로 배포 `seoulection-skin-weekly-retrain/weekly`를 만들고 `execute=True`로 돈다.
+`PREFECT_API_URL`이 없으면 로컬 임시 서버를 쓴다 — 상시 운영은 Prefect 서버/Cloud를 가리키고 `serve`를 systemd 등으로 띄운다. cron을 바꾸면 `prefect.yaml`을 고치고 `serve`를 다시 띄운다.
+플로우를 돌리는 자격증명에 필요한 권한: `sagemaker:StartPipelineExecution/DescribePipelineExecution/ListPipelineExecutionSteps`, S3 `feedback/` 목록, `pipeline-artifacts/` 읽기 + `prefect/last_run.json` 쓰기.
+
 ## 단계 스크립트 로컬 실행 (SageMaker 없이)
 
 입력은 전부 표준 데이터셋 형식(`crops.csv`, `labels.csv`, 크롭 PNG — `training/dataset.py` 맨 위). `scripts/upload_datasets.py`가 올리는 것과 같은 구성이다.

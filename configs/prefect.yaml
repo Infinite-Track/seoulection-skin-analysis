@@ -1,0 +1,19 @@
+# Prefect 주간 재학습 플로우 설정 (pipelines/prefect_flow.py).
+# SageMaker 파이프라인 이름·컨테이너·인스턴스는 pipeline.yaml, 버킷·접두사·리전은 paths.yaml에서 온다. 여기에는 스케줄·판단 기준만.
+
+flow_name: seoulection-skin-weekly-retrain   # Prefect 플로우 이름
+deployment_name: weekly                      # `python -m pipelines.prefect_flow serve` 가 만드는 배포 이름
+
+schedule:                                    # 주 1회. 바꾸면 serve 프로세스를 다시 띄운다
+  cron: "0 3 * * 1"                          # 매주 월요일 03:00
+  timezone: Asia/Seoul
+
+new_data:                                    # "재학습할 만큼 새 데이터가 있나" (pipelines/new_data.py)
+  source: s3_feedback                        # s3_feedback: S3 feedback/ 지난 실행 이후 파일 수 | recommend_api: TODO(추천 서버 count·export API)
+  min_new_files: 1                           # 이보다 적으면 파이프라인을 시작하지 않는다. 환경변수 MIN_NEW_FEEDBACK_FILES 가 있으면 그 값이 우선
+  marker_key: prefect/last_run.json          # 지난 실행 기준점(watermark) 파일 — s3://<bucket>/<s3.artifacts>/<pipeline name>/ 아래.
+                                             #   파이프라인이 Succeeded로 끝났을 때만 갱신 (실패하면 다음 주에 같은 데이터를 다시 센다)
+
+wait:                                        # 파이프라인 완료 대기
+  poll_seconds: 60
+  timeout_seconds: 57600                     # 16시간 = Training max_wait(12h, pipeline.yaml) + Processing 3단계 여유. 넘으면 플로우만 실패 (실행은 그대로 둔다)
