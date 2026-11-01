@@ -11,8 +11,8 @@
 | 1 | 학습 모듈 | [x] | [x] | 보고서 `docs/agents/reports/phase-1.md` · 리뷰 Major 1·Minor 2 반영, v2 체크포인트 검증은 보류 (2026-10-29) |
 | 2 | 데이터 준비 스크립트 | [x] | [x] | 보고서 `docs/agents/reports/phase-2.md` · 리뷰 Major 2건 반영 (2026-10-29) |
 | 3 | SageMaker 파이프라인 | [x] | [x] | 보고서 `docs/agents/reports/phase-3.md` · 리뷰 Major 3건 반영 (조건 축 all 고정·feedback 소스 ID 상대 경로·tar 분리 추출) · AWS 미호출(dry-run 정의·로컬 단계 스모크) (2026-10-29) |
-| 4 | Prefect 플로우 | [x] | [ ] | 보고서 `docs/agents/reports/phase-4.md` · Prefect 3.9 `flow.serve` 월 03:00 KST · 신규 데이터 인터페이스 `pipelines/new_data.py` · 리뷰 Major 1건 반영(S3 `active_run.json` 원자적 예약 + `ClientRequestToken` + 진행 중 실행 이어받기, 기준점 후퇴 방지) · 재검토 1회차 Major 2건 반영(ETag `If-Match` 소유권 CAS·`released` 묘비·기준점 단조 CAS / dry-run 읽기 전용) · 재검토 2회차 Major 1건 반영(ARN 없는 예약은 같은 `ClientRequestToken`·표시 이름·파라미터로 start 재요청해 멱등 복구, 확실한 종료·거절만 새 run_id) · AWS 미호출(대역 테스트 34개) (2026-10-30) |
-| 5 | 테스트·문서 | [ ] | [ ] | |
+| 4 | Prefect 플로우 | [x] | [x] | 보고서 `docs/agents/reports/phase-4.md` · Prefect 3.9 `flow.serve` 월 03:00 KST · 신규 데이터 인터페이스 `pipelines/new_data.py` · 리뷰 Major 1건 반영(S3 `active_run.json` 원자적 예약 + `ClientRequestToken` + 진행 중 실행 이어받기, 기준점 후퇴 방지) · 재검토 1회차 Major 2건 반영(ETag `If-Match` 소유권 CAS·`released` 묘비·기준점 단조 CAS / dry-run 읽기 전용) · 재검토 2회차 Major 1건 반영(ARN 없는 예약은 같은 `ClientRequestToken`·표시 이름·파라미터로 start 재요청해 멱등 복구, 확실한 종료·거절만 새 run_id) · AWS 미호출(대역 테스트 34개) (2026-10-30) · 재검토 3회차 PASS (2026-11-01) |
+| 5 | 테스트·문서 | [x] | [ ] | 보고서 `docs/agents/reports/phase-5.md` · 신규 테스트 4파일 39개(학습==서빙 전처리 비트 동일·타깃 왕복 / `SkinModel` 기본값=v2·인자 반영·설정 우선순위 / export 구성=`models/skin_v2`·reference.npz 재현 0.00e+00·운영 v2 1.43e-06·변조 감지 / 파이프라인 정의 — AWS API 전부 차단) · Phase 3·4 테스트에 `importorskip`(서빙 CI 호환) · `docs/mlops.md`(실행·환경변수·S3·승인·배포 절차) · `.env.training.example` · 전체 105 passed, CI 흉내 24 passed 6 skipped (2026-11-01) |
 
 ---
 

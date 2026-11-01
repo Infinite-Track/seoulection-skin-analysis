@@ -6,7 +6,10 @@ import tarfile
 
 import pytest
 
-from pipelines.steps import evaluate, prepare, util
+pytest.importorskip("scipy")  # pipelines.steps.evaluate → training.evaluate (requirements-train.txt). 서빙 CI 환경에는 없음 → 건너뜀
+pytest.importorskip("sklearn")
+
+from pipelines.steps import evaluate, prepare, util  # noqa: E402
 
 TASKS = {"pore_grade": {"select": "qwk"}, "wrinkle_ra": {"select": "spearman"}}
 BASE = {"tasks": {

@@ -11,7 +11,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from botocore.exceptions import ClientError
 
-from pipelines import new_data, prefect_flow
+pytest.importorskip("prefect")  # requirements-pipeline.txt — 서빙 CI 환경에는 없음 → 건너뜀
+
+from pipelines import new_data, prefect_flow  # noqa: E402
 
 T0 = datetime(2026, 10, 19, 18, 0, tzinfo=timezone.utc)  # 월요일 03:00 KST
 ARN = "arn:aws:sagemaker:us-east-1:000000000000:pipeline/seoulection-skin-retrain/execution/exec123"
