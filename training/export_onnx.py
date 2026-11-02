@@ -87,7 +87,10 @@ def export(checkpoint, out_dir, name=None, version=None, opset=None, reference_s
     meta = {
         "version": version,
         "model": {"name": name, "backbone": cfg.backbone, "params": net.num_params(),
-                  "trained_on": f"{saved.get('people')}명 {saved.get('datasets', [])}, 각도 {cfg.views}, {cfg.epochs}에폭",
+                  "trained_on": f"{saved.get('people')}명 {saved.get('datasets', [])}, 각도 {cfg.views}, "
+                                f"{saved.get('epochs_trained', cfg.epochs)}에폭"
+                                + (f" (검증 {len(saved['val_people'])}명 조기 종료, 점수 {saved['best_score']:.4f})"
+                                   if saved.get("val_people") else ""),
                   "parent": saved.get("parent")},
         "input": {
             "name": "crop", "shape": "(배치, 3, 세로, 가로) float32",

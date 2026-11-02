@@ -82,14 +82,16 @@ s3://seoulection-prod-skin-images/
 ### 4.1 로컬 학습·내보내기·평가 (`training/`)
 
 ```bash
-python -m training.train                                                   # 처음부터 (skin v2 재현: ImageNet 사전학습 → 6에폭)
+python -m training.train                                                   # 처음부터: 인물 80:20 분할 + 조기 종료(patience 6, 최대 15에폭), 최고 에폭 가중치
+python -m training.train --val-fraction 0 --epochs 6                       # skin v2 배포 학습 그대로 (검증 없이 6에폭 고정)
 python -m training.train --init-from outputs/models/<run>/model.pt --epochs 3 --lr-head 1e-4   # 파인튜닝
 python -m training.export_onnx --checkpoint outputs/models/<run>/model.pt  # model.pt → 서빙 파일 6개 (models/skin_v2/와 같은 구성)
 python -m training.evaluate --model-dir outputs/models/<run>               # 고정 테스트셋 → metrics.json
 python outputs/models/<run>/check_onnx.py                                  # 다른 머신에서 같은 모델인지 (해시 + reference.npz)
 ```
 
-하이퍼파라미터 우선순위: `TrainConfig` 기본값(= skin v2) < `configs/train.yaml` < CLI(`--lr-head 1e-4`처럼). 전체 목록은 `python -m training.train --help`.
+하이퍼파라미터 우선순위: `TrainConfig` 기본값(모델·손실·학습률 = skin v2, 검증 분할 `val_fraction` 0.2·`patience` 6·`epochs` 15 상한) < `configs/train.yaml` < CLI(`--lr-head 1e-4`처럼). 전체 목록은 `python -m training.train --help`.
+학습은 학습 인물을 인물 단위로 80:20 나눠 에폭마다 검증 점수(평가와 같은 지표)를 재고, `patience`만큼 개선이 없으면 멈춘 뒤 최고 에폭 가중치를 내보낸다. 검증 인물은 학습 데이터 안의 분할이고 고정 테스트셋과 별개다. 파이프라인의 `Epochs` 파라미터는 이 상한이다.
 동작 확인은 `--epochs 1 --max-batches 20 --l0-batches 5 --num-workers 0`.
 
 ### 4.2 데이터 준비 (`scripts/`) — 처음 한 번, 또는 새 데이터 소스

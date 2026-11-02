@@ -27,7 +27,7 @@ training:                             # Train (GPU)
   max_wait_seconds: 43200             # Spot 대기 포함 상한 (max_run 이상이어야 한다)
   checkpoint_local_path: /opt/ml/checkpoints   # train.py --checkpoint-dir. Spot 중단 후 여기서 이어간다
   config: configs/train_pipeline.yaml # 학습 데이터셋 정의 (채널 이름 = 데이터셋 이름)
-  epochs: 3                           # 파라미터 Epochs 기본값 (파인튜닝). 나머지 하이퍼파라미터는 TrainConfig 기본값(= skin v2)
+  epochs: 15                          # 파라미터 Epochs 기본값 = 최대 에폭. 학습 인물의 20%를 검증으로 떼어 조기 종료(patience 6)하므로 상한만 준다. 나머지는 TrainConfig 기본값
   hyperparameters:                    # train.py CLI 옵션으로 그대로 전달 (키 = 옵션 이름)
     num-workers: 4                    # ml.g5.xlarge vCPU 4
 

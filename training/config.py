@@ -26,7 +26,8 @@ CROPS_FILE, LABELS_FILE = "crops.csv", "labels.csv"  # 표준 데이터셋 파�
 
 @dataclass
 class TrainConfig:
-    """기본값은 전부 skin v2 배포 학습(face_analysis_AI/modeling/v2/deploy.ipynb의 DEPLOY)과 같다."""
+    """기본값은 skin v2 노트북 설정과 같다 — 모델·손실·학습률·증강은 deploy.ipynb의 DEPLOY, 검증 분할·조기 종료(val_fraction·patience·epochs)는
+    train.ipynb 최종 5-fold 방식(인물 단위 검증, patience 6, 최대 15에폭)을 따른다. v2 배포 학습 그대로는 --val-fraction 0 --epochs 6."""
 
     # ---- 데이터
     datasets: list = field(default_factory=list)  # [{name, dir, test_split?}] — yaml로만
@@ -43,7 +44,9 @@ class TrainConfig:
     threshold_init: str = "prior"   # 순서형 경계값 시작: "prior"(학습 데이터 등급 비율의 로짓) | "zero". 처음부터 학습할 때만
 
     # ---- 학습
-    epochs: int = 6                 # 검증 없이 고정 에폭 (5-fold 최고 에폭 중앙값)
+    val_fraction: float = 0.2       # 학습 인물 중 검증으로 뗄 비율 (인물 단위, seed로 고정). 0이면 검증 없이 epochs만큼 고정 학습 (= skin v2 배포 학습)
+    patience: int = 6               # 검증 점수가 이만큼 연속으로 안 좋아지면 중단, 최고 에폭 가중치를 쓴다 (v2 노트북 최종 5-fold와 같다)
+    epochs: int = 15                # 최대 에폭 (검증 있으면 조기 종료, 없으면 고정). v2 배포 학습 재현은 --val-fraction 0 --epochs 6
     schedule_epochs: int = 15       # 코사인 스케줄 길이 (에폭). epochs보다 길면 중간에 멈추는 것 — v2와 같다
     batch_size: int = 8             # 배치는 같은 부위끼리만
     lr_backbone: float = 2e-5

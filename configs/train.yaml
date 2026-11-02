@@ -13,7 +13,12 @@ datasets:
 #   CLI --init-from 또는 SageMaker 채널 SM_CHANNEL_BASE_MODEL이 있으면 그것을 쓴다
 init_from: null
 
-# 아래는 전부 skin v2와 같은 값이라 적지 않아도 된다. 바꿀 것만 적는다. 예:
-# epochs: 6
+# 검증·조기 종료 (기본값): 학습 인물의 20%를 인물 단위로 떼어(val_fraction 0.2, seed 고정) 에폭마다 검증 점수를 재고,
+#   patience(6)만큼 연속으로 좋아지지 않으면 멈춘 뒤 최고 에폭 가중치를 쓴다. epochs(15)는 상한이다.
+#   skin v2 배포 학습 그대로(검증 없이 800명 전원, 6에폭 고정)를 재현하려면: val_fraction: 0, epochs: 6
+# 그 밖의 값은 전부 skin v2와 같아 적지 않아도 된다. 바꿀 것만 적는다. 예:
+# val_fraction: 0.2
+# patience: 6
+# epochs: 15
 # lr_backbone: 2.0e-5
 # lr_head: 2.0e-4

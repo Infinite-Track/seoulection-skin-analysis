@@ -51,6 +51,16 @@ def evaluate_rows(model, rows, tasks, batch_size, min_groups):
                 grouped[key].append(out)
                 truth[key] = row["targets"]
 
+    return score_grouped(grouped, truth, tasks, min_groups)
+
+
+def score_grouped(grouped, truth, tasks, min_groups):
+    """(사람, 부위)별 크롭 출력 목록과 정답 → (항목별 지표, 점수). 학습 중 검증(training/train.py)과 평가가 같은 계산을 쓴다.
+
+    grouped: {(subject, region): [decode 출력 dict, ...]}, truth: {(subject, region): {항목: 원래 단위 정답}}
+    사진을 먼저 평균(회귀 값·등급 확률)한 뒤 지표를 재고, (사람, 부위) 쌍이 min_groups보다 적은 항목은 뺀다.
+    점수 = 항목별 선택 지표(select)의 평균 (nan은 0).
+    """
     results = {}
     for task, spec in tasks.items():
         keys = [k for k in grouped if task in truth[k]]

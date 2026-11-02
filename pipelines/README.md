@@ -61,7 +61,7 @@ python -m pipelines.prefect_flow serve [--paused] [--cron "0 3 * * 1" --timezone
 
 ```bash
 python -m pipelines.steps.prepare --testset DIR --replay DIR --feedback DIR|s3://… --out outputs/datasets/pipeline_train --manifest outputs/manifest.json
-python -m training.train --config configs/train_pipeline.yaml --init-from <model.pt> --epochs 3     # Prepare 출력으로 학습
+python -m training.train --config configs/train_pipeline.yaml --init-from <model.pt> --epochs 15    # Prepare 출력으로 학습 (인물 80:20 검증 + 조기 종료, epochs는 상한)
 python -m pipelines.steps.evaluate --candidate <model.tar.gz|폴더> --baseline models/skin_v2 --testset DIR --out outputs/eval [--limit-people 4] [--axes select]  # select는 분석용(선택 지표 6축만)
 python -m pipelines.steps.register --candidate <model.tar.gz|폴더> --evaluation outputs/eval --bucket B --models-prefix models --dry-run
 ```

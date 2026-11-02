@@ -21,6 +21,7 @@ to_model_input을 그대로 호출할 수 있다.
 """
 import csv
 import os
+import random
 from collections import defaultdict
 from pathlib import Path
 
@@ -74,6 +75,21 @@ def load_rows(datasets, tasks, cfg: TrainConfig, part):
                                  region=r["region"], view=r["view"], device=r["device"], file=str(root / r["file"]),
                                  face_h=float(r["face_h"]), targets=t))
     return rows
+
+
+def split_people(rows, fraction, seed):
+    """학습 행을 인물 단위로 (학습, 검증, 검증 인물 목록)으로 나눈다. 같은 사람의 사진은 정답이 같아 사진 단위로 나누면 점수가 부풀려진다.
+
+    fraction 0이면 전부 학습. 인물 목록을 정렬한 뒤 random.Random(seed)로 뽑으므로 같은 데이터·seed면 같은 분할이다.
+    """
+    if fraction <= 0:
+        return rows, [], []
+    people = sorted({r["subject"] for r in rows})
+    n_val = max(1, round(len(people) * fraction))
+    if n_val >= len(people):
+        raise RuntimeError(f"검증 분할 불가: 인물 {len(people)}명에서 {n_val}명을 떼면 학습 인물이 없다 (--val-fraction 0 또는 데이터 추가)")
+    val = set(random.Random(seed).sample(people, n_val))
+    return [r for r in rows if r["subject"] not in val], [r for r in rows if r["subject"] in val], sorted(val)
 
 
 def regression_values(rows, tasks):
