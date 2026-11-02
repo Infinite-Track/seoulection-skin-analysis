@@ -82,3 +82,15 @@
 | 4 | — | v2 `deploy_model.pt` 로드·재export·reference 비교 | ⏭ 보류: 파일 미도착 (사용자가 S3 `models/skin_v2/`에 업로드 예정) |
 
 반영 후 재검증: pyflakes 통과, 기존 테스트 24 passed, 전체 스모크(MPS·convnext_small·workers 2) 재실행 → export(ONNX vs PyTorch 3.6e-06)·`check_onnx.py` 통과·`evaluate` 정상.
+
+## 재검토 반영 (2026-11-02, `reviews/phase-1.md` 재검토 1·2회차)
+
+| # | 심각도 | 수정 | 검증 |
+|---|---|---|---|
+| R1 (1회차 잔여) | Minor | `training/dataset.py make_loader`: DataLoader에 전용 `torch.Generator().manual_seed(seed)` 전달 → 워커 base_seed 추출이 전역 torch RNG(dropout)를 소비하지 않음 | tiny·CPU·convnext_tiny·`--num-workers 2`: 연속 2에폭 vs 1+재개 1에폭 가중치 최대 차이 **0.000e+00**, train_loss 동일 |
+| ES1 (2회차) | Major | `training/train.py`: 재개 시 `bad_epochs ≥ patience`면 학습 루프 생략, `stopped_early=True`, 저장된 최고 모델만 저장·export. `--patience` 증가 재개는 계속 학습 | tiny 수동: patience 1 조기 종료 후 같은 ckpt 재개 → "이미 조기 종료된 상태 → 추가 학습 없이 최고 1에폭 가중치" / `tests/test_train_early_stopping.py` 10개(조기 종료·종료 후 재개 불변·patience 증가 재개·연속==재개·검증 없음·ES2·회귀 정답 누락·history) |
+| ES2 (2회차) | Minor | `training/train.py check_validation`: 유효(nan 아닌) 선택 지표가 없으면 `RuntimeError`+안내. 검증 점수는 유효 지표 평균(nan→0 대체는 평가 전용) | 테스트 `eval_min_groups 50` → 거절, all-nan → 거절, 일부 nan → 제외 |
+| 추가 | — | 처음부터 학습할 때 회귀 항목 정답이 하나도 없으면 `meta_tasks` KeyError 대신 설명과 함께 멈춤 | 테스트 `wrinkle_ra` 라벨 제거 → RuntimeError |
+
+분할 의미(2회차 요청 3): aihub_kr 965명 = **고정 테스트 165명 제외 → 800명을 640 학습 / 160 검증**. 고정 테스트는 조기 종료에 쓰지 않고 `evaluate.py` 최종 비교에만 쓴다. README·docs/mlops.md에 명시.
+보류: 실제 v2 `deploy_model.pt` 로드·재export·reference 비교 (로컬 미확보).

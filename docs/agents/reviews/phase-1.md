@@ -1,3 +1,4 @@
+VERDICT: FAIL
 # Phase 1 검토
 
 ## 요약
@@ -59,13 +60,55 @@ Phase 1 요구 파일은 모두 존재한다. 금지 경로의 기존 파일 변
 
 ### 남은 발견 사항
 
-| # | 심각도 | 파일:줄 | 문제 | 근거 | 수정 제안 |
-|---|---|---|---|---|---|
-| R1 (기존 #2 잔여) | Minor | `training/dataset.py:177`, `training/train.py:161` | persistent worker를 사용하는 연속 학습과 새 프로세스 재개가 전역 torch RNG를 다르게 소비해 dropout 결과가 달라진다. 현재 문서의 연속 학습과 가중치가 같다는 설명은 workers=2→2에서는 성립하지 않는다. | DataLoader에 별도 `generator`가 없다. PyTorch iterator 생성은 `torch.empty(...).random_(generator=loader.generator)`로 base_seed를 뽑으므로 현재는 전역 CPU RNG를 소비한다. 연속 학습의 2에폭은 persistent iterator를 `_reset`해 이 추출을 반복하지 않지만, 재개 시에는 `restore_rng` 이후 새 iterator를 만들어 추가로 소비한다. 위 실제 CPU 학습에서 가중치 최대 차이 **4.53e-04**를 재현했다. 보고서의 workers=0→2 검증은 양쪽 모두 다음 iterator 생성이 발생하므로 이 경우를 검증하지 못한다. | DataLoader에 모델/dropout과 분리한 전용 `torch.Generator`를 전달하고 seed 및 필요한 상태를 관리한다. workers=2→2처럼 persistent iterator가 유지되는 연속 실행과 새 프로세스 재개를 비교하는 검증을 추가한다. 수정 후 README와 Phase 1 보고서의 재현성 설명도 검증 범위에 맞춘다. |
+| # | 심각도 | 파일:줄 | 문제 | 근거 | 수정 제안 | 반영 |
+|---|---|---|---|---|---|---|
+| R1 (기존 #2 잔여) | Minor | `training/dataset.py:177`, `training/train.py:161` | persistent worker를 사용하는 연속 학습과 새 프로세스 재개가 전역 torch RNG를 다르게 소비해 dropout 결과가 달라진다. 현재 문서의 연속 학습과 가중치가 같다는 설명은 workers=2→2에서는 성립하지 않는다. | DataLoader에 별도 `generator`가 없다. PyTorch iterator 생성은 `torch.empty(...).random_(generator=loader.generator)`로 base_seed를 뽑으므로 현재는 전역 CPU RNG를 소비한다. 연속 학습의 2에폭은 persistent iterator를 `_reset`해 이 추출을 반복하지 않지만, 재개 시에는 `restore_rng` 이후 새 iterator를 만들어 추가로 소비한다. 위 실제 CPU 학습에서 가중치 최대 차이 **4.53e-04**를 재현했다. 보고서의 workers=0→2 검증은 양쪽 모두 다음 iterator 생성이 발생하므로 이 경우를 검증하지 못한다. | DataLoader에 모델/dropout과 분리한 전용 `torch.Generator`를 전달하고 seed 및 필요한 상태를 관리한다. workers=2→2처럼 persistent iterator가 유지되는 연속 실행과 새 프로세스 재개를 비교하는 검증을 추가한다. 수정 후 README와 Phase 1 보고서의 재현성 설명도 검증 범위에 맞춘다. | ✅ 반영 (2026-11-02) — `make_loader`가 `torch.Generator().manual_seed(seed)`를 DataLoader `generator`로 전달. tiny 데이터셋·CPU·convnext_tiny·`--num-workers 2` 연속 2에폭 vs 1+재개 1에폭: 가중치 최대 차이 **0.000e+00**, train_loss 동일. README 재현성 설명 갱신 |
 
 ### Claude에게 전달할 수정 요청 (우선순위 순)
 
-1. DataLoader의 worker base_seed 생성이 모델 전역 RNG에 영향을 주지 않게 분리하고, **workers=2→2의 연속 2에폭 vs 1+재개 1에폭**을 재검증한다.
-2. 실제 v2 체크포인트 재export 검증은 체크포인트 확보 후 별도로 수행한다(이전부터 미실행인 항목).
+1. DataLoader의 worker base_seed 생성이 모델 전역 RNG에 영향을 주지 않게 분리하고, **workers=2→2의 연속 2에폭 vs 1+재개 1에폭**을 재검증한다. — ✅ 반영 (2026-11-02, 차이 0)
+2. 실제 v2 체크포인트 재export 검증은 체크포인트 확보 후 별도로 수행한다(이전부터 미실행인 항목). — ⏭ 보류: `deploy_model.pt` 로컬 미확보 (사용자 S3 업로드 후 수행)
 
 이번 재검토에서는 리뷰 파일만 수정했다.
+
+## 재검토 (2회차)
+
+2026-11-02 — 인물 단위 80:20 분할·early stopping 변경(`b427517`) 추가 검수.
+
+### 요약
+
+**수정 필요 — Major 1건, Minor 1건.** 인물 단위 분할·검증 점수 기반 조기 종료·최고 에폭 가중치 저장은 구현됐다. 다만 조기 종료가 이미 확정된 last.pt를 재개할 때 종료 결정을 지키지 않는다.
+
+사용자 표현의 train/test와 구현의 train/validation을 구분해야 한다. 현재 구현은 **기존 고정 테스트셋을 먼저 제외하고 남은 인물을 80:20으로 학습/검증 분할**한다. 실제 aihub_kr은 **640명 학습 + 160명 검증 + 165명 최종 테스트**다. 순수 입력 1,000명에 split_people만 적용하면 800/200이지만, 전체 1,000명 중 고정 테스트 200명을 먼저 빼는 설정이라면 640/160/200이 된다. 최종 테스트를 early stopping에 쓰지 않는 점은 적절하며, 이것을 데이터 누수 결함으로 집계하지 않았다. 이번 변경이 전체 인원을 train/test 두 집합으로만 나누는 구현은 아니라는 점을 사용자에게 명시한다.
+
+### 실행한 검증
+
+- `git status --short`, `git diff main --stat`, `git diff main --name-status`, `git show b427517`으로 변경 범위를 확인했다. 지정한 11개 파일은 모두 해당 커밋의 변경 파일과 일치한다(+147/-42). main 대비 누적 변경은 65파일·7,748줄 추가이며 기존 Phase들을 포함한다. 금지 경로의 기존 파일 변경은 없고 common·tests에는 신규 파일만 추가돼 있다.
+- `training/train.py`, `config.py`, `dataset.py`, `evaluate.py`, `export_onnx.py` 및 지정한 YAML·README·docs/mlops.md를 직접 대조했다. 이번 사용자 지시의 변경을 기존 고정 6에폭 계획보다 우선해 검토했다.
+- `PYTHONDONTWRITEBYTECODE=1 PREFECT_HOME=/tmp/earlystop-review-prefect PREFECT_SERVER_ANALYTICS_ENABLED=false AWS_EC2_METADATA_DISABLED=true .venv/bin/python -m pytest -q -p no:cacheprovider`: **105 passed, 3 warnings, 21.97초**. 경고는 ONNX dynamic_axes 및 SageMaker PipelineSession 안내였다. 기존 export/reference·서빙 호환성 테스트도 포함된다.
+- `.venv/bin/python -B -m pyflakes training`: 오류 출력 없음.
+- 합성 1,000명(인물별 2행)의 `split_people(.2, 42)`: 학습 800명 / 검증 200명 / 겹침 0. 입력 행 순서를 뒤집어도 검증 인물 목록이 같았다.
+- 실제 기본 설정으로 `load_rows` 및 `split_people` 실행: 학습 640명 / 검증 160명 / 고정 테스트 165명, 테스트와 학습·검증의 교집합 0.
+- 표준화 통계·prior threshold·l0는 새 학습 rows로 계산하고 검증은 증강 없이 전체 loader로 계산하는 경로를 확인했다. `--init-from`에서는 기존 stats/l0를 상속하는 정책을 유지한다. 상속 모델 자체가 이미 해당 인물로 학습했는지까지 검증하는 것은 아니다.
+- 임시 경로 `/tmp/earlystop-review-1faak6z9`에서 실제 main·분할·Dataset·loader·loss·optimizer·checkpoint 저장을 실행했다. 외부 가중치 다운로드를 피하기 위해 모델 생성만 작은 Linear 모델로 대체하고, load_rows는 10명·6부위 합성 행을 제공했다. 조기 종료 결정 검증에는 validate의 점수를 의도적으로 제어했다.
+  - 최대 5에폭, patience=1, 검증 점수 0.9→0.8: **2에폭에서 종료**, best_epoch=1. 저장 model.pt의 가중치가 1에폭 스냅샷과 텐서별로 완전히 일치했다.
+  - 동일 설정·같은 checkpoint-dir로 다시 실행하고 후속 점수를 1.0→0.9로 제공: **3·4에폭을 추가 실행**, history 길이 2→4, best_epoch 1→3. 아래 ES1 재현이다.
+- 별도 age-only 작은 모델과 **실제 validate/score_grouped**로 10명→8/2 분할: 기본 eval_min_groups=10 때문에 검증 지표는 `{}`인데 score=0으로 처리돼 1에폭을 최고점으로 채택하고 2에폭에 조기 종료했다(patience=1). 아래 ES2 재현이다.
+- 같은 경로에서 `--val-fraction 0 --epochs 1`: 검증 없이 정확히 1에폭, val_people=[], stopped_early=False로 정상 완료.
+- pytest에는 새 split_people/조기 종료의 종료 후 재개 시나리오가 추가되지 않았다. 따라서 105 passed만으로 이번 변경의 모든 상태 전이를 검증했다고 볼 수 없다. 이번 검토의 추가 재현과 구분한다.
+- AWS 호출 없음. 실제 대규모 재학습·CUDA/Spot·운영 v2 체크포인트 재export는 반복하지 않았다. exporter가 최종 model.pt를 로드하는 경로와 best 가중치 저장은 확인했지만, 이번 합성 조기 종료 모델로 새 ONNX를 생성한 것은 아니다.
+
+### 발견 사항
+
+| # | 심각도 | 파일:줄 | 문제 | 근거 | 수정 제안 | 반영 |
+|---|---|---|---|---|---|---|
+| ES1 | Major | `training/train.py:202`, `training/train.py:206` | 조기 종료된 last.pt를 재개해도 학습을 다시 진행한다. export·최종 저장 전 중단으로 재시작되는 경우, 원래의 종료 결정과 최고 모델이 달라질 수 있다. | bad_epochs와 best는 복원하지만 stopped_early를 무조건 False로 초기화하고 다음 에폭 루프에 들어간다. patience 확인은 추가 학습 후 237행에서만 한다. 위 재현에서 동일 설정인데도 history **2→4**, 최고 에폭 **1→3**으로 바뀌었다. 점수는 분기 검증을 위해 대역으로 제어했으며 모델 학습·저장은 실제 실행했다. | 복원한 bad_epochs가 현재 patience 이상이면 학습 루프를 건너뛰고 저장된 best를 복원해 최종 저장/export만 수행한다. patience를 의도적으로 늘려 계속하는 정책은 별도로 처리한다. 중단 직전/조기 종료 직후/최종 export 실패 후 재개 및 patience 변경을 회귀 검증한다. | ✅ 반영 — 재개 시 복원한 `bad_epochs ≥ patience`면 학습 루프를 건너뛰고(`stopped_early=True`) 저장된 best를 저장·export. patience를 늘리면 이어서 학습. `tests/test_train_early_stopping.py`: 조기 종료 후 재개 → history·best_epoch·가중치 불변, patience 증가 재개 → 계속, 연속 vs 재개 동일 |
+| ES2 | Minor | `training/evaluate.py:75`, `training/train.py:228` | 유효한 검증 지표가 하나도 없어도 score 0을 정상 점수로 간주해 첫 에폭을 최고 모델로 저장하고 조기 종료한다. 작은 데이터·희소 라벨에서는 성능 검증 없이 학습이 중단된다. | 실제 validate 경로의 2명 age-only 검증에서 min_groups=10 미달 → results={}·score=0.0 → best_epoch=1·stopped_early=True를 확인했다. score_grouped의 기존 평가용 fallback이 이번에 학습 종료 결정에도 사용되면서 드러나는 동작이다. | 학습 검증에서는 results가 비거나 선택 지표가 모두 비유효하면 설명과 함께 실패시키거나, 명시한 검증 loss 등의 대체 기준을 사용한다. min_groups를 낮추거나 val_fraction=0으로 실행할 수 있다는 안내도 제공한다. | ✅ 반영 — `check_validation`: 유효(nan 아닌) 선택 지표가 없으면 `RuntimeError`(안내: --val-fraction 늘리기 / --eval-min-groups 낮추기 / --val-fraction 0). 검증 점수는 유효 지표만의 평균(nan→0 대체는 평가 전용). 테스트: `eval_min_groups 50` → 거절, all-nan → 거절, 일부 nan → 제외 |
+
+### Claude에게 전달할 수정 요청 (우선순위 순)
+
+1. ES1: 이미 patience에 도달한 체크포인트 재개가 추가 학습 없이 같은 최고 모델을 저장·내보내는지 수정하고 검증한다. — ✅ 반영 (2026-11-02)
+2. ES2: 유효한 검증 지표가 없을 때 점수 0으로 자동 모델 선택하지 않도록 가드와 안내를 추가한다. — ✅ 반영 (2026-11-02)
+3. 사용자에게 현재 비율이 **학습 후보 인물 내 train/validation 80:20 + 별도 고정 test**임을 유지해 설명한다. 고정 테스트셋을 early stopping에 재사용하지 않는다. — ✅ 반영 (README·docs/mlops.md에 명시, 사용자 보고에 포함)
+
+이번 작업에서는 이 리뷰 파일만 수정했다.

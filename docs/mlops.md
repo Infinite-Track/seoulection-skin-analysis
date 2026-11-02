@@ -91,7 +91,7 @@ python outputs/models/<run>/check_onnx.py                                  # 다
 ```
 
 하이퍼파라미터 우선순위: `TrainConfig` 기본값(모델·손실·학습률 = skin v2, 검증 분할 `val_fraction` 0.2·`patience` 6·`epochs` 15 상한) < `configs/train.yaml` < CLI(`--lr-head 1e-4`처럼). 전체 목록은 `python -m training.train --help`.
-학습은 학습 인물을 인물 단위로 80:20 나눠 에폭마다 검증 점수(평가와 같은 지표)를 재고, `patience`만큼 개선이 없으면 멈춘 뒤 최고 에폭 가중치를 내보낸다. 검증 인물은 학습 데이터 안의 분할이고 고정 테스트셋과 별개다. 파이프라인의 `Epochs` 파라미터는 이 상한이다.
+학습은 학습 인물을 인물 단위로 80:20 나눠 에폭마다 검증 점수(평가와 같은 지표)를 재고, `patience`만큼 개선이 없으면 멈춘 뒤 최고 에폭 가중치를 내보낸다. 검증 인물은 학습 데이터 안의 분할이고 고정 테스트셋과 별개다(aihub_kr: 테스트 165명 제외 → 640/160). 파이프라인의 `Epochs` 파라미터는 이 상한이다. 조기 종료 직후 끊긴 체크포인트를 재개하면 추가 학습 없이 최고 모델만 다시 저장하고, 유효한 검증 지표가 없으면 멈춘다(`--eval-min-groups`·`--val-fraction` 조정).
 동작 확인은 `--epochs 1 --max-batches 20 --l0-batches 5 --num-workers 0`.
 
 ### 4.2 데이터 준비 (`scripts/`) — 처음 한 번, 또는 새 데이터 소스

@@ -102,9 +102,26 @@ def cpu_state_dict(net):
     return {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
 
 
+def check_validation(results, tasks, min_groups):
+    """검증 지표가 하나도 유효하지 않으면 멈춘다. 점수 0을 '첫 에폭이 최고'로 오해해 조기 종료하는 것을 막는다.
+
+    results가 비면 (사람, 부위) 쌍이 min_groups보다 적은 것이고, 선택 지표가 전부 nan이면 정답이 상수라 상관·QWK를 못 잰 것이다.
+    """
+    valid = [t for t, r in results.items() if r[tasks[t]["select"]] == r[tasks[t]["select"]]]  # nan 제외
+    if not valid:
+        raise RuntimeError(
+            f"검증 점수를 낼 수 있는 항목이 없다 (지표가 나온 항목 {sorted(results)}, 유효 0개; eval_min_groups={min_groups}). "
+            "검증 인물이 너무 적거나 정답이 한 값뿐이다 → --val-fraction을 늘리거나 --eval-min-groups를 낮추거나, "
+            "검증 없이 고정 에폭으로 --val-fraction 0")
+    return valid
+
+
 @torch.no_grad()
 def validate(net, loader, rows, tasks, meta_list, device, use_amp, min_groups):
-    """검증 인물 → (항목별 지표, 점수). 출력 해석(common.tasks.decode)과 지표(evaluate.score_grouped)는 서빙·평가와 같다."""
+    """검증 인물 → (항목별 지표, 점수). 출력 해석(common.tasks.decode)과 지표(evaluate.score_grouped)는 서빙·평가와 같다.
+
+    점수는 유효한(nan 아닌) 선택 지표의 평균이다 — 평가(score_grouped)의 nan→0 대체를 학습 종료 결정에는 쓰지 않는다.
+    """
     net.eval()
     grouped, truth = defaultdict(list), {}
     for images, _, _, indices in loader:
@@ -115,7 +132,9 @@ def validate(net, loader, rows, tasks, meta_list, device, use_amp, min_groups):
             key = (row["subject"], row["region"])
             grouped[key].append(decode(logits, meta_list, row["region"]))
             truth[key] = row["targets"]
-    return score_grouped(grouped, truth, tasks, min_groups)
+    results, _ = score_grouped(grouped, truth, tasks, min_groups)
+    valid = check_validation(results, tasks, min_groups)
+    return results, float(sum(results[t][tasks[t]["select"]] for t in valid) / len(valid))
 
 
 def main(argv=None):
@@ -151,6 +170,9 @@ def main(argv=None):
 
     if init_from is None:
         stats = regression_stats(tasks, regression_values(rows, tasks))  # 학습 인물만 (검증 정보 누수 방지)
+        missing = [t for t, spec in tasks.items() if spec["kind"] == "regression" and t not in stats]
+        if missing:
+            raise RuntimeError(f"학습 데이터에 회귀 항목 {missing}의 정답이 없다 → 표준화 통계를 낼 수 없다 (labels.csv·tasks.yaml 확인)")
         thresholds = prior_thresholds(rows, tasks) if cfg.threshold_init == "prior" else None
         torch.manual_seed(cfg.seed)
         net = SkinModel.from_config(cfg, tasks, pretrained=last is None, threshold_init=thresholds)
@@ -203,8 +225,15 @@ def main(argv=None):
         print(f"  {checkpoint_dir / LAST_NAME}에서 재개: {start_epoch}에폭부터"
               + (f" (최고 {best['epoch']}에폭 {best['score']:.4f}, 정체 {bad_epochs}에폭)" if val_rows else ""), flush=True)
 
-    stopped_early = False
+    # 이미 patience에 도달한 last.pt(조기 종료 직후·export 전에 끊긴 경우)는 더 학습하지 않고 저장된 최고 모델만 다시 저장·내보낸다.
+    # patience를 늘려서 재개하면 bad_epochs < patience 라 자연히 이어서 학습한다.
+    stopped_early = val_loader is not None and last is not None and bad_epochs >= cfg.patience
+    if stopped_early:
+        print(f"  이미 조기 종료된 상태 (정체 {bad_epochs} ≥ patience {cfg.patience}) → 추가 학습 없이 최고 {best['epoch']}에폭 가중치를 저장한다",
+              flush=True)
     for epoch in range(start_epoch, cfg.epochs + 1):
+        if stopped_early:
+            break
         net.train()
         sampler.set_epoch(epoch)  # 배치 순서·증강 난수가 에폭으로 정해진다 → 재개해도 같은 순서
         started, total = time.time(), 0.0
@@ -230,7 +259,7 @@ def main(argv=None):
                 best, bad_epochs = dict(score=score, epoch=epoch, state=cpu_state_dict(net), results=results), 0
             else:
                 bad_epochs += 1
-            summary = "  ".join(f"{t[:9]} {r[tasks[t]['select']]:.3f}" for t, r in results.items())
+            summary = "  ".join(f"{t[:9]} {r[tasks[t]['select']]:.3f}" for t, r in results.items())  # nan = 그 항목은 점수에서 제외
             line += f" | 검증 {summary} | 점수 {score:.4f}{' ★' if improved else f' (정체 {bad_epochs}/{cfg.patience})'}"
         history.append(entry)
         print(line + f" ({time.time() - started:.0f}초)", flush=True)

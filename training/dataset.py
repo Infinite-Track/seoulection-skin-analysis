@@ -177,7 +177,10 @@ class RegionBatchSampler(Sampler):
 
 
 def make_loader(rows, stats, cfg: TrainConfig, tasks, train, device="cpu"):
+    """DataLoader. 워커 base_seed 추출에 쓰는 generator를 따로 준다 — 없으면 iterator를 만들 때마다 전역 torch RNG를 소비해서
+    (persistent 워커를 유지하는 연속 학습 vs 새 프로세스 재개) dropout 난수가 어긋난다. 증강·배치 순서는 이 generator와 무관하다."""
     dataset = RegionDataset(rows, stats, cfg, tasks, train=train)
     sampler = RegionBatchSampler(rows, cfg.batch_size, shuffle=train, drop_last=train, seed=cfg.seed)
-    return DataLoader(dataset, batch_sampler=sampler, num_workers=cfg.num_workers,
+    generator = torch.Generator().manual_seed(cfg.seed)
+    return DataLoader(dataset, batch_sampler=sampler, num_workers=cfg.num_workers, generator=generator,
                       persistent_workers=cfg.num_workers > 0, pin_memory=device == "cuda")
