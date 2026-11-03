@@ -29,7 +29,7 @@ git clone https://github.com/Infinite-Track/seoulection-skin-analysis.git && cd 
 git checkout feature/mlops-training            # 또는 v3 설정이 들어간 브랜치
 
 sudo yum install -y mesa-libGL mesa-libEGL mesa-libGLES   # opencv·mediapipe 네이티브 라이브러리 (import에 필요)
-conda create -y -n skin python=3.11 && source activate skin   # 노트북 인스턴스에는 conda가 있다. 시스템 python 대신 3.11 환경을 만든다
+conda create -y -n skin python=3.12 && source activate skin   # 학습 패키지 고정 버전(scipy 1.18 등)은 Python 3.12 기준. 서빙 Docker(3.11)와 달라도 된다
 pip install -r requirements.txt -r requirements-train.txt   # 리눅스용 torch 2.14 휠은 CUDA 런타임을 포함한다 (별도 index 불필요)
 
 aws s3 sync s3://seoulection-prod-skin-images/datasets/full/aihub_kr/ outputs/datasets/aihub_kr/ --only-show-errors   # 11GB, 같은 리전이라 수 분
