@@ -1,0 +1,15 @@
+# 학습·내보내기·평가 (training/, scripts/). 서빙 requirements.txt 위에 더해서 설치한다:
+#   pip install -r requirements.txt -r requirements-train.txt
+# numpy·opencv·mediapipe·onnxruntime·boto3는 requirements.txt에서 온다 (크롭·정규화가 서빙과 같은 버전이어야 한다).
+# 버전은 skin v2를 학습한 환경(face_analysis_AI/requirements.txt, torch 2.14 / timm 1.0.29)과 같게 고정.
+# SageMaker 학습 컨테이너의 torch 버전은 Phase 3에서 맞춘다 (상태 사전·ONNX 내보내기 결과는 버전에 민감하지 않지만 opset 18은 torch 2.9+ 필요).
+torch==2.14.0
+torchvision==0.29.1
+timm==1.0.29
+# torch.onnx.export(dynamo=True) 백엔드
+onnx==1.23.0
+onnxscript==0.7.2
+# 설정·평가
+PyYAML==6.0.3
+scipy==1.18.1
+scikit-learn==1.9.1

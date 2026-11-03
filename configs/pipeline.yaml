@@ -1,0 +1,45 @@
+# SageMaker 재학습 파이프라인 설정 (pipelines/sagemaker_pipeline.py). 버킷·접두사·리전은 paths.yaml, 역할 ARN은 환경변수 SAGEMAKER_ROLE_ARN.
+# 인스턴스 타입·베이스 모델·데이터 위치·최소 신규 건수·에폭은 파이프라인 **파라미터**가 되어 실행할 때 바꿀 수 있다 (여기 값은 기본값).
+
+name: seoulection-skin-retrain        # 파이프라인 이름 = S3 pipeline-artifacts/<name>/ 아래에 산출물
+model_package_group: seoulection-skin # Model Registry 그룹 (없으면 Register 단계가 만든다)
+
+# 현재 운영 모델 (파인튜닝 시작점 + 비교 기준). 파라미터 BaseModelUri 기본값 = s3://<bucket>/<s3.models>/<current_model>/
+#   폴더에 서빙 파일(meta.json, skin.onnx, skin.onnx.data)과 체크포인트(model.pt 또는 v2의 deploy_model.pt)가 있어야 한다
+current_model: skin_v2
+
+# AWS 제공 PyTorch 컨테이너 (커스텀 이미지 없음). 학습(GPU)·Processing(CPU) 모두 같은 버전.
+#   torch 2.9 이상이어야 export_onnx(opset 18, dynamo)가 된다. py312는 mediapipe 0.10.35 휠이 있는 버전.
+framework:
+  version: "2.9"
+  py_version: py312
+
+processing:                           # Prepare·Evaluate·Register (CPU)
+  instance_type: ml.m5.2xlarge        # 파라미터 ProcessingInstanceType 기본값. Evaluate는 두 모델 × 테스트셋 추론이라 vCPU가 많을수록 빠르다
+  volume_size_gb: 50
+  max_runtime_seconds: 14400
+
+training:                             # Train (GPU)
+  instance_type: ml.g5.xlarge         # 파라미터 TrainingInstanceType 기본값. 같은 프로세서 종류(GPU) 안에서만 바꿀 것 — 이미지는 정의 시점에 정해진다
+  volume_size_gb: 100
+  spot: true                          # Managed Spot. --no-spot 으로 등록하면 온디맨드
+  max_run_seconds: 21600              # 6시간
+  max_wait_seconds: 43200             # Spot 대기 포함 상한 (max_run 이상이어야 한다)
+  checkpoint_local_path: /opt/ml/checkpoints   # train.py --checkpoint-dir. Spot 중단 후 여기서 이어간다
+  config: configs/train_pipeline.yaml # 학습 데이터셋 정의 (채널 이름 = 데이터셋 이름)
+  epochs: 15                          # 파라미터 Epochs 기본값 = 최대 에폭. 학습 인물의 20%를 검증으로 떼어 조기 종료(patience 6)하므로 상한만 준다. 나머지는 TrainConfig 기본값
+  hyperparameters:                    # train.py CLI 옵션으로 그대로 전달 (키 = 옵션 이름)
+    num-workers: 4                    # ml.g5.xlarge vCPU 4
+
+prepare:                              # Prepare 단계
+  testset_name: aihub_kr              # S3 datasets/testset/<name>/ · configs/splits/<name>_test.txt 와 대조
+  replay_name: aihub_kr               # S3 datasets/replay/<name>/
+  min_feedback_crops: 1               # 파라미터 MinFeedbackCrops 기본값. 라벨 있는 신규(feedback) 크롭이 이보다 적으면 Prepare에서 멈춘다 (0이면 replay만으로도 진행)
+
+condition:                            # Evaluate → Condition. 축 = 현재 모델이 낸 (항목, 지표) 전부 — 선택 지표뿐 아니라 acc·within1·spearman·mae 포함
+  tolerance: 0.0                      # 새 모델 지표 ≥ 현재 모델 지표 - tolerance (MAE는 ≤ + tolerance). 0이면 "모든 축에서 현재 모델 이상"
+                                      # (등록 경로는 항상 모든 축을 본다. 선택 지표만 보는 evaluate --axes select는 로컬 분석용)
+
+register:                             # Condition 통과 시
+  version_prefix: skin_v              # S3 <s3.models>/<version_prefix><N>/ — N은 기존 버전 최댓값 + 1 (덮어쓰기 없음)
+  model_name_format: "{name} v{n}"    # meta.json model.name 갱신 (v2는 "skin v2"). null이면 학습 때 이름 그대로

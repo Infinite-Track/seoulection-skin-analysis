@@ -1,0 +1,16 @@
+# SageMaker 컨테이너(AWS PyTorch, configs/pipeline.yaml framework)에 코드 번들과 함께 올라가 pip로 추가 설치되는 목록.
+# torch·torchvision은 컨테이너 것을 그대로 쓴다 (requirements-train.txt의 torch 2.14 핀은 로컬 학습용 — 여기 넣으면 CUDA torch를 갈아엎는다).
+# 크롭·정규화가 서빙과 같아야 하므로 numpy·opencv·mediapipe·onnxruntime은 requirements.txt(서빙)와 같은 버전.
+numpy==2.4.6
+opencv-contrib-python==5.0.0.93
+mediapipe==0.10.35
+onnxruntime==1.30.0
+# 학습·내보내기·평가 (requirements-train.txt와 같은 버전)
+timm==1.0.29
+onnx==1.23.0
+onnxscript==0.7.2
+PyYAML==6.0.3
+scipy==1.18.1
+scikit-learn==1.9.1
+# Prepare(feedback 내려받기)·Register(S3·Model Registry)
+boto3

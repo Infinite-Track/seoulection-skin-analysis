@@ -1,0 +1,12 @@
+# SageMaker 파이프라인의 Training 단계가 쓰는 학습 설정 (configs/pipeline.yaml training.config).
+# 형식·우선순위는 train.yaml과 같다: TrainConfig 기본값(= skin v2) < 이 파일 < CLI(= 파이프라인 hyperparameters).
+
+# Prepare 단계가 replay + feedback을 합쳐 만든 표준 데이터셋 하나. SageMaker에서는 채널 SM_CHANNEL_TRAIN이 dir을 대신한다.
+#   테스트 인물은 Prepare에서 이미 뺐으므로 test_split이 없다 (평가는 Evaluate 단계가 testset 채널로 한다)
+#   dir은 로컬 검증용: python -m pipelines.steps.prepare --out outputs/datasets/pipeline_train ... 로 만든 뒤 같은 설정으로 돌릴 수 있다
+datasets:
+  - name: train
+    dir: outputs/datasets/pipeline_train
+
+# 파인튜닝 시작점은 채널 SM_CHANNEL_BASE_MODEL(현재 운영 모델 폴더)이다. 로컬 검증은 --init-from 으로 준다.
+init_from: null

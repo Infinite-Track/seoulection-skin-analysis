@@ -1,0 +1,6 @@
+# 파이프라인 등록·실행을 하는 쪽(개발 PC, Prefect 워커)에 설치. 컨테이너 안에는 들어가지 않는다 (그쪽은 pipelines/requirements-container.txt).
+#   pip install -r requirements.txt -r requirements-pipeline.txt
+# SageMaker Python SDK v3 (sagemaker.train.ModelTrainer, sagemaker.mlops.workflow). boto3는 requirements.txt에서 온다.
+sagemaker>=3.27,<4
+# 주간 재학습 플로우 (pipelines/prefect_flow.py). 플로우 자체는 boto3만 쓰므로 Prefect 워커에는 sagemaker SDK가 없어도 된다
+prefect>=3.9,<4

@@ -1,0 +1,33 @@
+# skin v3 베이스 모델 학습 설정 (2026-11-03 결정). 적지 않은 키는 TrainConfig 기본값(= skin v2).
+#   python -m training.train --config configs/train_v3.yaml --model-dir outputs/models/skin_v3
+#
+# v2와 다른 점: 백본 ConvNeXt-Tiny, 증강 강화. 나머지(손실·학습률·헤드·동결 2단계·드롭아웃 0.4)는 v2 그대로.
+# 학습 데이터: aihub_kr 965명 중 고정 테스트 165명을 뺀 800명을 인물 단위 8:2로 나눠 검증·조기 종료 (val_fraction 0.2, patience 6, 최대 15에폭).
+# SageMaker 노트북에서는 S3 datasets/full/aihub_kr/ 를 outputs/datasets/aihub_kr/ 로 받아 두면 아래 dir이 그대로 맞는다 (docs/base-model-v3.md).
+
+datasets:
+  - name: aihub_kr
+    dir: outputs/datasets/aihub_kr
+    test_split: configs/splits/aihub_kr_test.txt
+
+init_from: null                              # 처음부터 (ImageNet 사전학습)
+
+backbone: convnext_tiny.fb_in22k_ft_in1k     # v2는 convnext_small. Tiny = 2,800만 파라미터, 추론·학습 약 2배 빠름
+model_name: skin v3                          # meta.json model.name → 서빙 modelVersion "skin v3 <날짜>"
+
+# 증강 — v2(회전 ±20° / 배율 ±10% / 밝기 ±20%, 적용 확률 0.5)보다 세게. (2026-11-03 결정)
+#   목적: 사용자가 사진을 편하게 찍어도 되게 — 고개 기울임·거리 차이에 모델이 덜 흔들리도록.
+#   회전 ±35°: 실제로 찍히는 기울임 범위의 상한. 더 크면 현실에 없는 각도를 학습한다.
+#   배율 ±20%: 촬영 거리 차이 + 얼굴 세로 길이(face_h) 추정 오차를 덮는다.
+#   참고: v2 1차 실험에서는 ×3(30/0.15/0.30)이 Small 백본·데이터셋 사진 기준으로 기준값보다 약간 나빴다 (docs/agents/phase-0.md).
+#         여기서는 데이터셋 점수보다 실사용 견고성을 우선한다. 최고 에폭이 13~15에 걸리면 epochs·schedule_epochs를 20으로 올릴 것.
+#   주의: 증강은 모델의 허용 범위만 넓힌다. 얼굴 검출 실패·해상도 1MP·피부 20,000px 같은 전처리 기준은 별개 (serving .env MIN_*).
+aug_rotate: 35
+aug_scale: 0.20
+aug_bright: 0.30
+aug_bright_p: 0.7
+
+val_fraction: 0.2
+patience: 6
+epochs: 15
+schedule_epochs: 15
