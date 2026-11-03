@@ -6,7 +6,7 @@ model_package_group: seoulection-skin # Model Registry 그룹 (없으면 Registe
 
 # 현재 운영 모델 (파인튜닝 시작점 + 비교 기준). 파라미터 BaseModelUri 기본값 = s3://<bucket>/<s3.models>/<current_model>/
 #   폴더에 서빙 파일(meta.json, skin.onnx, skin.onnx.data)과 체크포인트(model.pt 또는 v2의 deploy_model.pt)가 있어야 한다
-current_model: skin_v2
+current_model: skin_v3
 
 # AWS 제공 PyTorch 컨테이너 (커스텀 이미지 없음). 학습(GPU)·Processing(CPU) 모두 같은 버전.
 #   torch 2.9 이상이어야 export_onnx(opset 18, dynamo)가 된다. py312는 mediapipe 0.10.35 휠이 있는 버전.
